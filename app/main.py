@@ -1,9 +1,22 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 from datetime import datetime
 
 app = FastAPI(title="Closer CRM API")
+
+# --------- CORS (ESTO ES LO NUEVO Y CLAVE) ----------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",  # frontend local
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# ---------------------------------------------------
 
 # ----- "Base de datos" temporal en memoria -----
 MODELS = []

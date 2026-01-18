@@ -1,56 +1,65 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+import os
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
-from datetime import datetime
+from supabase import create_client
 
+
+# =========================
+# App
+# =========================
 app = FastAPI(title="Closer CRM API")
 
-# --------- CORS (ESTO ES LO NUEVO Y CLAVE) ----------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",  # frontend local
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-# ---------------------------------------------------
 
-# ----- "Base de datos" temporal en memoria -----
-MODELS = []
-NEXT_ID = 1
+# =========================
+# Supabase client (usa variables de entorno en Render)
+# Deben existir:
+# - SUPABASE_URL
+# - SUPABASE_SERVICE_ROLE_KEY
+# =========================
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# ----- Esquemas -----
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    # Esto te ayuda a detectar rápido si Render no tiene bien las variables
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+# =========================
+# Schemas
+# =========================
 class ModelCreate(BaseModel):
-    name: str
+    stage_name: str
 
-class ModelOut(BaseModel):
-    id: int
-    name: str
-    created_at: str
 
-# ----- Endpoints -----
+# =========================
+# Endpoints
+# =========================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.get("/models")
-def list_models() -> List[ModelOut]:
-    return MODELS
+def list_models():
+    try:
+        res = supabase.table("models").select("*").order("created_at", desc=True).execute()
+        return res.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/models")
-def create_model(payload: ModelCreate) -> ModelOut:
-    global NEXT_ID
+def create_model(payload: ModelCreate):
+    try:
+        res = supabase.table("models").insert(
+            {"stage_name": payload.stage_name}
+        ).execute()
 
-    model = {
-        "id": NEXT_ID,
-        "name": payload.name,
-        "created_at": datetime.utcnow().isoformat()
-    }
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Insert failed: empty response")
 
-    NEXT_ID += 1
-    MODELS.append(model)
-
-    return model
+        return res.data[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

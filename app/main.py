@@ -1,7 +1,7 @@
 import os
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from supabase import create_client
@@ -264,6 +264,200 @@ def deactivate_platform(platform_id: str):
             raise HTTPException(status_code=404, detail="Platform not found")
 
         return {"ok": True, "id": platform_id, "active": False}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================================
+# MODEL ↔ PLATFORM (model_platforms)
+# ==========================================================
+class ModelPlatformCreate(BaseModel):
+    platform_id: str
+    pct_day: Optional[int] = None
+    pct_night: Optional[int] = None
+    bonus_threshold_usd: Optional[int] = None
+    bonus_pct: Optional[int] = None
+
+
+class ModelPlatformUpdate(BaseModel):
+    pct_day: Optional[int] = None
+    pct_night: Optional[int] = None
+    bonus_threshold_usd: Optional[int] = None
+    bonus_pct: Optional[int] = None
+    active: Optional[bool] = None
+
+
+def _get_model_or_404(model_id: str) -> Dict[str, Any]:
+    res = supabase.table("models").select("id, active").eq("id", model_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model not found")
+    return res.data
+
+
+def _get_platform_or_404(platform_id: str) -> Dict[str, Any]:
+    res = supabase.table("platforms").select("id, active").eq("id", platform_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Platform not found")
+    return res.data
+
+
+def _is_unique_violation(e: Exception) -> bool:
+    msg = str(e).lower()
+    return ("duplicate" in msg) or ("unique" in msg) or ("violates unique constraint" in msg)
+
+
+@app.get("/models/{model_id}/platforms")
+def list_model_platforms(
+    model_id: str,
+    include_inactive: bool = Query(False, description="If true, includes inactive relations"),
+):
+    """
+    Lista plataformas asignadas a una modelo (incluye info de la plataforma para UI).
+    """
+    try:
+        _get_model_or_404(model_id)
+
+        q = supabase.table("model_platforms").select("*").eq("model_id", model_id)
+        if not include_inactive:
+            q = q.eq("active", True)
+
+        rel: List[Dict[str, Any]] = q.order("created_at", desc=True).execute().data or []
+        if not rel:
+            return []
+
+        platform_ids = list({r["platform_id"] for r in rel if r.get("platform_id")})
+        plats: List[Dict[str, Any]] = (
+            supabase.table("platforms")
+            .select("id, name, calc_type, token_usd_rate, active")
+            .in_("id", platform_ids)
+            .execute()
+            .data
+            or []
+        )
+        plat_map = {p["id"]: p for p in plats}
+
+        out = []
+        for r in rel:
+            p = plat_map.get(r["platform_id"], {})
+            out.append(
+                {
+                    "model_id": r.get("model_id"),
+                    "platform_id": r.get("platform_id"),
+                    "platform_name": p.get("name"),
+                    "calc_type": p.get("calc_type"),
+                    "token_usd_rate": p.get("token_usd_rate"),
+                    "platform_active": p.get("active"),
+                    "pct_day": r.get("pct_day"),
+                    "pct_night": r.get("pct_night"),
+                    "bonus_threshold_usd": r.get("bonus_threshold_usd"),
+                    "bonus_pct": r.get("bonus_pct"),
+                    "active": r.get("active"),
+                    "created_at": r.get("created_at"),
+                }
+            )
+
+        out.sort(key=lambda x: (x["platform_name"] or "").lower())
+        return out
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/models/{model_id}/platforms")
+def add_platform_to_model(model_id: str, payload: ModelPlatformCreate):
+    """
+    Asigna una plataforma a una modelo (con overrides opcionales).
+    """
+    try:
+        m = _get_model_or_404(model_id)
+        if m.get("active") is False:
+            raise HTTPException(status_code=400, detail="Model is inactive")
+
+        p = _get_platform_or_404(payload.platform_id)
+        if p.get("active") is False:
+            raise HTTPException(status_code=400, detail="Platform is inactive")
+
+        insert_data = {
+            "model_id": model_id,
+            "platform_id": payload.platform_id,
+            "pct_day": payload.pct_day,
+            "pct_night": payload.pct_night,
+            "bonus_threshold_usd": payload.bonus_threshold_usd,
+            "bonus_pct": payload.bonus_pct,
+            "active": True,
+        }
+
+        res = supabase.table("model_platforms").insert(insert_data).execute()
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Insert failed: empty response")
+        return res.data[0]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if _is_unique_violation(e):
+            raise HTTPException(status_code=409, detail="Platform already assigned to this model")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/models/{model_id}/platforms/{platform_id}")
+def update_model_platform(model_id: str, platform_id: str, payload: ModelPlatformUpdate):
+    """
+    Edita overrides / activa-desactiva la relación modelo ↔ plataforma.
+    """
+    try:
+        _get_model_or_404(model_id)
+        _get_platform_or_404(platform_id)
+
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        if not data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        res = (
+            supabase.table("model_platforms")
+            .update(data)
+            .eq("model_id", model_id)
+            .eq("platform_id", platform_id)
+            .execute()
+        )
+
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Relation not found")
+
+        return res.data[0]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/models/{model_id}/platforms/{platform_id}")
+def deactivate_model_platform(model_id: str, platform_id: str):
+    """
+    Soft delete de la relación: active=false
+    """
+    try:
+        _get_model_or_404(model_id)
+        _get_platform_or_404(platform_id)
+
+        res = (
+            supabase.table("model_platforms")
+            .update({"active": False})
+            .eq("model_id", model_id)
+            .eq("platform_id", platform_id)
+            .execute()
+        )
+
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Relation not found")
+
+        return {"ok": True, "model_id": model_id, "platform_id": platform_id, "active": False}
+
     except HTTPException:
         raise
     except Exception as e:

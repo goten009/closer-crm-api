@@ -1,5 +1,6 @@
 import os
 from typing import Optional, Dict, Any, List
+from datetime import date
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,6 +50,40 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ==========================================================
+# Helpers
+# ==========================================================
+def _is_unique_violation(e: Exception) -> bool:
+    msg = str(e).lower()
+    return ("duplicate" in msg) or ("unique" in msg) or ("violates unique constraint" in msg)
+
+
+def _get_model_or_404(model_id: str) -> Dict[str, Any]:
+    res = supabase.table("models").select("id, active").eq("id", model_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model not found")
+    return res.data
+
+
+def _get_platform_or_404(platform_id: str) -> Dict[str, Any]:
+    res = supabase.table("platforms").select("id, active").eq("id", platform_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Platform not found")
+    return res.data
+
+
+def _get_session_or_404(session_id: str) -> Dict[str, Any]:
+    res = supabase.table("sessions").select("*").eq("id", session_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return res.data
+
+
+def _validate_turn_type(turn_type: str) -> None:
+    if turn_type not in ("day", "night"):
+        raise HTTPException(status_code=400, detail="turn_type must be 'day' or 'night'")
 
 
 # ==========================================================
@@ -124,6 +159,8 @@ def get_model(model_id: str):
 def update_model(model_id: str, payload: ModelUpdate):
     try:
         data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        if "turn_type" in data:
+            _validate_turn_type(str(data["turn_type"]))
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -289,25 +326,6 @@ class ModelPlatformUpdate(BaseModel):
     active: Optional[bool] = None
 
 
-def _get_model_or_404(model_id: str) -> Dict[str, Any]:
-    res = supabase.table("models").select("id, active").eq("id", model_id).single().execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Model not found")
-    return res.data
-
-
-def _get_platform_or_404(platform_id: str) -> Dict[str, Any]:
-    res = supabase.table("platforms").select("id, active").eq("id", platform_id).single().execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Platform not found")
-    return res.data
-
-
-def _is_unique_violation(e: Exception) -> bool:
-    msg = str(e).lower()
-    return ("duplicate" in msg) or ("unique" in msg) or ("violates unique constraint" in msg)
-
-
 @app.get("/models/{model_id}/platforms")
 def list_model_platforms(
     model_id: str,
@@ -457,6 +475,275 @@ def deactivate_model_platform(model_id: str, platform_id: str):
             raise HTTPException(status_code=404, detail="Relation not found")
 
         return {"ok": True, "model_id": model_id, "platform_id": platform_id, "active": False}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================================
+# SESSIONS (sessions)
+# ==========================================================
+class SessionCreate(BaseModel):
+    model_id: str
+    session_date: date
+    turn_type: str  # "day" | "night"
+    notes: Optional[str] = None
+    active: bool = True
+
+
+class SessionUpdate(BaseModel):
+    session_date: Optional[date] = None
+    turn_type: Optional[str] = None
+    notes: Optional[str] = None
+    active: Optional[bool] = None
+
+
+@app.get("/sessions")
+def list_sessions(
+    session_date: Optional[date] = Query(None, description="YYYY-MM-DD"),
+    model_id: Optional[str] = None,
+    include_inactive: bool = False,
+):
+    """
+    Lista sesiones. Filtra por fecha y/o model_id.
+    Por defecto devuelve active=true, a menos que include_inactive=true.
+    """
+    try:
+        q = supabase.table("sessions").select("*").order("session_date", desc=True)
+
+        if session_date:
+            q = q.eq("session_date", str(session_date))
+        if model_id:
+            q = q.eq("model_id", model_id)
+        if not include_inactive:
+            q = q.eq("active", True)
+
+        res = q.execute()
+        return res.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sessions")
+def create_session(payload: SessionCreate):
+    """
+    Crea una sesión (model_id + session_date + turn_type).
+    En BD suele existir unique(model_id, session_date, turn_type).
+    """
+    try:
+        _get_model_or_404(payload.model_id)
+        _validate_turn_type(payload.turn_type)
+
+        res = supabase.table("sessions").insert(payload.model_dump()).execute()
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Insert failed: empty response")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        if _is_unique_violation(e):
+            raise HTTPException(status_code=409, detail="Session already exists for that model/date/turn")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str):
+    try:
+        return _get_session_or_404(session_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/sessions/{session_id}")
+def update_session(session_id: str, payload: SessionUpdate):
+    try:
+        _get_session_or_404(session_id)
+
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        if "turn_type" in data:
+            _validate_turn_type(str(data["turn_type"]))
+        if not data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        res = supabase.table("sessions").update(data).eq("id", session_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        if _is_unique_violation(e):
+            raise HTTPException(status_code=409, detail="Session already exists for that model/date/turn")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/sessions/{session_id}")
+def deactivate_session(session_id: str):
+    """
+    Soft delete: sessions.active=false
+    """
+    try:
+        _get_session_or_404(session_id)
+
+        res = supabase.table("sessions").update({"active": False}).eq("id", session_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        return {"ok": True, "id": session_id, "active": False}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================================
+# SESSION ENTRIES (session_platform_entries)  <-- columnas reales
+# ==========================================================
+class SessionEntryUpsert(BaseModel):
+    platform_id: str
+
+    value_in: Optional[float] = None
+    value_out: Optional[float] = None
+
+    tokens: Optional[float] = None
+    usd_value: Optional[float] = None
+    usd_earned: Optional[float] = None
+
+    locked_in: Optional[bool] = None
+    active: Optional[bool] = True
+
+
+@app.get("/sessions/{session_id}/entries")
+def list_session_entries(
+    session_id: str,
+    include_inactive: bool = False,
+):
+    """
+    Lista entries de una sesión.
+    """
+    try:
+        _get_session_or_404(session_id)
+
+        q = supabase.table("session_platform_entries").select("*").eq("session_id", session_id)
+        if not include_inactive:
+            q = q.eq("active", True)
+
+        res = q.order("created_at", desc=False).execute()
+        return res.data or []
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sessions/{session_id}/entries")
+def upsert_session_entry(
+    session_id: str,
+    payload: SessionEntryUpsert,
+    allow_update_locked: bool = Query(False, description="If true, allows updating locked_in=true rows"),
+):
+    """
+    Upsert por (session_id, platform_id).
+    - Si ya existe, actualiza.
+    - Si no existe, crea.
+
+    Si la fila está locked_in=true y allow_update_locked=false, bloquea el update.
+    """
+    try:
+        _get_session_or_404(session_id)
+        _get_platform_or_404(payload.platform_id)
+
+        # ¿Existe ya?
+        existing = (
+            supabase.table("session_platform_entries")
+            .select("*")
+            .eq("session_id", session_id)
+            .eq("platform_id", payload.platform_id)
+            .execute()
+        ).data
+
+        data = payload.model_dump()
+        data["session_id"] = session_id
+
+        if existing:
+            row = existing[0]
+            if row.get("locked_in") is True and not allow_update_locked:
+                raise HTTPException(status_code=400, detail="Entry is locked_in and cannot be updated")
+
+            # update solo campos no-None
+            upd = {k: v for k, v in data.items() if v is not None}
+            # nunca actualizar session_id/platform_id por accidente
+            upd.pop("session_id", None)
+            upd.pop("platform_id", None)
+
+            if not upd:
+                raise HTTPException(status_code=400, detail="No fields to update")
+
+            res = (
+                supabase.table("session_platform_entries")
+                .update(upd)
+                .eq("session_id", session_id)
+                .eq("platform_id", payload.platform_id)
+                .execute()
+            )
+
+            if not res.data:
+                raise HTTPException(status_code=500, detail="Update failed: empty response")
+            return res.data[0]
+
+        # insert
+        ins = {
+            "session_id": session_id,
+            "platform_id": payload.platform_id,
+            "value_in": payload.value_in,
+            "value_out": payload.value_out,
+            "tokens": payload.tokens,
+            "usd_value": payload.usd_value,
+            "usd_earned": payload.usd_earned,
+            "locked_in": payload.locked_in if payload.locked_in is not None else False,
+            "active": True if payload.active is None else bool(payload.active),
+        }
+
+        res = supabase.table("session_platform_entries").insert(ins).execute()
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Insert failed: empty response")
+        return res.data[0]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if _is_unique_violation(e):
+            # si por alguna razón hay unique (session_id, platform_id), intentaron crear repetido
+            raise HTTPException(status_code=409, detail="Entry already exists for this session/platform")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/sessions/{session_id}/entries/{platform_id}")
+def deactivate_session_entry(session_id: str, platform_id: str):
+    """
+    Soft delete: entry.active=false (por session_id+platform_id)
+    """
+    try:
+        _get_session_or_404(session_id)
+        _get_platform_or_404(platform_id)
+
+        res = (
+            supabase.table("session_platform_entries")
+            .update({"active": False})
+            .eq("session_id", session_id)
+            .eq("platform_id", platform_id)
+            .execute()
+        )
+
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Entry not found")
+
+        return {"ok": True, "session_id": session_id, "platform_id": platform_id, "active": False}
 
     except HTTPException:
         raise

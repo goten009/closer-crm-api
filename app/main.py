@@ -81,9 +81,21 @@ def _get_session_or_404(session_id: str) -> Dict[str, Any]:
     return res.data
 
 
+def _get_room_or_404(room_id: str) -> Dict[str, Any]:
+    res = supabase.table("rooms").select("id, active").eq("id", room_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Room not found")
+    return res.data
+
+
 def _validate_turn_type(turn_type: str) -> None:
     if turn_type not in ("day", "night"):
         raise HTTPException(status_code=400, detail="turn_type must be 'day' or 'night'")
+
+
+def _validate_shift_slot(shift_slot: str) -> None:
+    if shift_slot not in ("morning", "afternoon", "night"):
+        raise HTTPException(status_code=400, detail="shift_slot must be 'morning', 'afternoon', or 'night'")
 
 
 # ==========================================================
@@ -134,6 +146,7 @@ def list_models():
 @app.post("/models")
 def create_model(payload: ModelCreate):
     try:
+        _validate_turn_type(payload.turn_type)
         res = supabase.table("models").insert(payload.model_dump()).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
@@ -745,6 +758,200 @@ def deactivate_session_entry(session_id: str, platform_id: str):
 
         return {"ok": True, "session_id": session_id, "platform_id": platform_id, "active": False}
 
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================================
+# ROOMS (rooms)
+# ==========================================================
+class RoomCreate(BaseModel):
+    name: str
+    active: bool = True
+
+
+class RoomUpdate(BaseModel):
+    name: Optional[str] = None
+    active: Optional[bool] = None
+
+
+@app.get("/rooms")
+def list_rooms(include_inactive: bool = Query(False)):
+    try:
+        q = supabase.table("rooms").select("*").order("name")
+        if not include_inactive:
+            q = q.eq("active", True)
+        res = q.execute()
+        return res.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/rooms")
+def create_room(payload: RoomCreate):
+    try:
+        res = supabase.table("rooms").insert(payload.model_dump()).execute()
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Insert failed: empty response")
+        return res.data[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/rooms/{room_id}")
+def update_room(room_id: str, payload: RoomUpdate):
+    try:
+        _get_room_or_404(room_id)
+
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        if not data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        res = supabase.table("rooms").update(data).eq("id", room_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Room not found")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/rooms/{room_id}")
+def deactivate_room(room_id: str):
+    try:
+        _get_room_or_404(room_id)
+        res = supabase.table("rooms").update({"active": False}).eq("id", room_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Room not found")
+        return {"ok": True, "room_id": room_id, "active": False}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================================
+# ROOM ASSIGNMENTS (room_assignments)
+# ==========================================================
+class RoomAssignmentCreate(BaseModel):
+    assignment_date: Optional[date] = None  # YYYY-MM-DD. Si viene None -> hoy
+    shift_slot: str  # morning | afternoon | night
+    model_id: str
+    room_id: str
+    active: bool = True
+
+
+class RoomAssignmentUpdate(BaseModel):
+    room_id: Optional[str] = None
+    shift_slot: Optional[str] = None
+    active: Optional[bool] = None
+
+
+@app.get("/assignments")
+def list_assignments(
+    assignment_date: Optional[date] = Query(None, description="YYYY-MM-DD"),
+    shift_slot: Optional[str] = Query(None, description="morning|afternoon|night"),
+    room_id: Optional[str] = None,
+    model_id: Optional[str] = None,
+    include_inactive: bool = False,
+):
+    """
+    Lista asignaciones de room por fecha y turno operativo.
+    """
+    try:
+        q = supabase.table("room_assignments").select("*").order("created_at", desc=False)
+
+        if assignment_date:
+            q = q.eq("assignment_date", str(assignment_date))
+        if shift_slot:
+            _validate_shift_slot(shift_slot)
+            q = q.eq("shift_slot", shift_slot)
+        if room_id:
+            q = q.eq("room_id", room_id)
+        if model_id:
+            q = q.eq("model_id", model_id)
+        if not include_inactive:
+            q = q.eq("active", True)
+
+        res = q.execute()
+        return res.data or []
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/assignments")
+def create_assignment(payload: RoomAssignmentCreate):
+    """
+    Crea una asignación diaria para una modelo en un room, por turno operativo.
+    Recomendado en DB: unique(assignment_date, shift_slot, model_id)
+    """
+    try:
+        _get_model_or_404(payload.model_id)
+        _get_room_or_404(payload.room_id)
+        _validate_shift_slot(payload.shift_slot)
+
+        data = payload.model_dump()
+        if data.get("assignment_date") is None:
+            data["assignment_date"] = date.today()
+
+        res = supabase.table("room_assignments").insert(data).execute()
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Insert failed: empty response")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        if _is_unique_violation(e):
+            raise HTTPException(status_code=409, detail="Assignment already exists for that date/shift/model")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/assignments/{assignment_id}")
+def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
+    try:
+        # Validar existencia
+        existing = (
+            supabase.table("room_assignments")
+            .select("*")
+            .eq("id", assignment_id)
+            .single()
+            .execute()
+        )
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Assignment not found")
+
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        if "shift_slot" in data:
+            _validate_shift_slot(str(data["shift_slot"]))
+        if "room_id" in data:
+            _get_room_or_404(str(data["room_id"]))
+        if not data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        res = supabase.table("room_assignments").update(data).eq("id", assignment_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Assignment not found")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        if _is_unique_violation(e):
+            raise HTTPException(status_code=409, detail="Assignment already exists for that date/shift/model")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/assignments/{assignment_id}")
+def deactivate_assignment(assignment_id: str):
+    try:
+        res = supabase.table("room_assignments").update({"active": False}).eq("id", assignment_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Assignment not found")
+        return {"ok": True, "assignment_id": assignment_id, "active": False}
     except HTTPException:
         raise
     except Exception as e:

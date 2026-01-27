@@ -60,16 +60,6 @@ def _is_unique_violation(e: Exception) -> bool:
     return ("duplicate" in msg) or ("unique" in msg) or ("violates unique constraint" in msg)
 
 
-def _validate_turn_type(turn_type: str) -> None:
-    if turn_type not in ("day", "night"):
-        raise HTTPException(status_code=400, detail="turn_type must be 'day' or 'night'")
-
-
-def _validate_shift_slot(shift_slot: str) -> None:
-    if shift_slot not in ("morning", "afternoon", "night"):
-        raise HTTPException(status_code=400, detail="shift_slot must be 'morning', 'afternoon', or 'night'")
-
-
 def _get_model_or_404(model_id: str) -> Dict[str, Any]:
     res = supabase.table("models").select("id, active").eq("id", model_id).single().execute()
     if not res.data:
@@ -91,71 +81,50 @@ def _get_room_or_404(room_id: str) -> Dict[str, Any]:
     return res.data
 
 
-# -------------------------
-# IMPORTANT: sessions now live in shift_sessions (FK requirement)
-# -------------------------
-def _get_shift_session_or_404(session_id: str) -> Dict[str, Any]:
-    res = supabase.table("shift_sessions").select("*").eq("id", session_id).single().execute()
+def _validate_turn_type(turn_type: str) -> None:
+    if turn_type not in ("day", "night"):
+        raise HTTPException(status_code=400, detail="turn_type must be 'day' or 'night'")
+
+
+def _validate_shift_slot(shift_slot: str) -> None:
+    if shift_slot not in ("morning", "afternoon", "night"):
+        raise HTTPException(status_code=400, detail="shift_slot must be 'morning', 'afternoon', or 'night'")
+
+
+# --- IMPORTANT: sessions table mapping ---
+# Your DB uses shift_sessions with a date column named shift_date.
+# Frontend expects "session_date". We keep API stable by mapping shift_date <-> session_date.
+
+SESSIONS_TABLE = "shift_sessions"
+SESSIONS_DATE_COL = "shift_date"  # DB column name
+
+
+def _session_db_to_api(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert DB row (shift_sessions) to API shape (session_date)."""
+    if not row:
+        return row
+    out = dict(row)
+    if SESSIONS_DATE_COL in out:
+        out["session_date"] = out.get(SESSIONS_DATE_COL)
+    # Do not leak internal name if you don't want; but harmless to keep shift_date too
+    # out.pop(SESSIONS_DATE_COL, None)
+    return out
+
+
+def _session_api_to_db(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert API payload (session_date) to DB shape (shift_date)."""
+    data = dict(payload)
+    if "session_date" in data:
+        data[SESSIONS_DATE_COL] = data["session_date"]
+        data.pop("session_date", None)
+    return data
+
+
+def _get_session_or_404(session_id: str) -> Dict[str, Any]:
+    res = supabase.table(SESSIONS_TABLE).select("*").eq("id", session_id).single().execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Session not found")
-    return res.data
-
-
-def _get_session_or_404_compat(session_id: str) -> Dict[str, Any]:
-    """
-    Compat: try shift_sessions first, fallback to sessions.
-    """
-    try:
-        res = supabase.table("shift_sessions").select("*").eq("id", session_id).single().execute()
-        if res.data:
-            return res.data
-    except Exception:
-        pass
-
-    res2 = supabase.table("sessions").select("*").eq("id", session_id).single().execute()
-    if not res2.data:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return res2.data
-
-
-def _ensure_shift_session_exists(session_id: str) -> None:
-    """
-    Guarantees that shift_sessions has the session_id required by FK from session_platform_entries.
-    If not present, tries to copy from legacy 'sessions'.
-    """
-    try:
-        exists = supabase.table("shift_sessions").select("id").eq("id", session_id).single().execute()
-        if exists.data:
-            return
-    except Exception:
-        # if table doesn't exist or single() fails, let it raise below when used
-        pass
-
-    # fallback: look in legacy sessions and backfill into shift_sessions
-    legacy = supabase.table("sessions").select("*").eq("id", session_id).single().execute()
-    if not legacy.data:
-        raise HTTPException(status_code=404, detail="Session not found (neither shift_sessions nor sessions)")
-
-    row = legacy.data
-
-    # Build insert payload for shift_sessions.
-    # Assumption: shift_sessions has same columns as sessions (id, model_id, session_date, turn_type, notes, active).
-    # If your table has more columns, we can extend later.
-    ins = {
-        "id": row.get("id"),
-        "model_id": row.get("model_id"),
-        "session_date": str(row.get("session_date")) if row.get("session_date") else None,
-        "turn_type": row.get("turn_type"),
-        "notes": row.get("notes"),
-        "active": True if row.get("active") is None else bool(row.get("active")),
-    }
-
-    try:
-        supabase.table("shift_sessions").insert(ins).execute()
-    except Exception as e:
-        # if already exists due to race, ignore; else raise
-        if not _is_unique_violation(e):
-            raise HTTPException(status_code=500, detail=f"Could not backfill shift_sessions: {str(e)}")
+    return _session_db_to_api(res.data)
 
 
 # ==========================================================
@@ -193,7 +162,7 @@ class ModelUpdate(BaseModel):
 def list_models():
     try:
         res = supabase.table("models").select("*").order("created_at", desc=True).execute()
-        return res.data or []
+        return res.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -276,7 +245,7 @@ class PlatformUpdate(BaseModel):
 def list_platforms():
     try:
         res = supabase.table("platforms").select("*").order("name", desc=False).execute()
-        return res.data or []
+        return res.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -499,7 +468,7 @@ def deactivate_model_platform(model_id: str, platform_id: str):
 
 
 # ==========================================================
-# SESSIONS (shift_sessions is canonical)
+# SESSIONS (shift_sessions)  <-- FIXED
 # ==========================================================
 class SessionCreate(BaseModel):
     model_id: str
@@ -523,17 +492,19 @@ def list_sessions(
     include_inactive: bool = False,
 ):
     try:
-        q = supabase.table("shift_sessions").select("*").order("session_date", desc=True)
+        # NOTE: DB uses shift_date, not session_date
+        q = supabase.table(SESSIONS_TABLE).select("*").order(SESSIONS_DATE_COL, desc=True)
 
         if session_date:
-            q = q.eq("session_date", str(session_date))
+            q = q.eq(SESSIONS_DATE_COL, str(session_date))
         if model_id:
             q = q.eq("model_id", model_id)
         if not include_inactive:
             q = q.eq("active", True)
 
         res = q.execute()
-        return res.data or []
+        rows = res.data or []
+        return [_session_db_to_api(r) for r in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -544,23 +515,15 @@ def create_session(payload: SessionCreate):
         _get_model_or_404(payload.model_id)
         _validate_turn_type(payload.turn_type)
 
-        data = payload.model_dump()
-        # ensure JSON-serializable date
-        data["session_date"] = str(payload.session_date)
+        data = _session_api_to_db(payload.model_dump())
+        # ensure date exists
+        if data.get(SESSIONS_DATE_COL) is None:
+            data[SESSIONS_DATE_COL] = date.today()
 
-        res = supabase.table("shift_sessions").insert(data).execute()
+        res = supabase.table(SESSIONS_TABLE).insert(data).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
-
-        created = res.data[0]
-
-        # (Optional) also mirror into legacy sessions to keep old data consistent
-        try:
-            supabase.table("sessions").insert({**data, "id": created.get("id")}).execute()
-        except Exception:
-            pass
-
-        return created
+        return _session_db_to_api(res.data[0])
     except HTTPException:
         raise
     except Exception as e:
@@ -572,7 +535,7 @@ def create_session(payload: SessionCreate):
 @app.get("/sessions/{session_id}")
 def get_session(session_id: str):
     try:
-        return _get_session_or_404_compat(session_id)
+        return _get_session_or_404(session_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -582,22 +545,22 @@ def get_session(session_id: str):
 @app.patch("/sessions/{session_id}")
 def update_session(session_id: str, payload: SessionUpdate):
     try:
-        # prefer shift_sessions
-        _get_shift_session_or_404(session_id)
+        _get_session_or_404(session_id)
 
-        data = {k: v for k, v in payload.model_dump().items() if v is not None}
-        if "turn_type" in data:
-            _validate_turn_type(str(data["turn_type"]))
-        if "session_date" in data and data["session_date"] is not None:
-            data["session_date"] = str(data["session_date"])
-        if not data:
+        raw = {k: v for k, v in payload.model_dump().items() if v is not None}
+        if "turn_type" in raw:
+            _validate_turn_type(str(raw["turn_type"]))
+        if not raw:
             raise HTTPException(status_code=400, detail="No fields to update")
 
-        res = supabase.table("shift_sessions").update(data).eq("id", session_id).execute()
+        data = _session_api_to_db(raw)
+
+        res = supabase.table(SESSIONS_TABLE).update(data).eq("id", session_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        return res.data[0]
+        return _session_db_to_api(res.data[0])
+
     except HTTPException:
         raise
     except Exception as e:
@@ -609,10 +572,12 @@ def update_session(session_id: str, payload: SessionUpdate):
 @app.delete("/sessions/{session_id}")
 def deactivate_session(session_id: str):
     try:
-        _get_shift_session_or_404(session_id)
-        res = supabase.table("shift_sessions").update({"active": False}).eq("id", session_id).execute()
+        _get_session_or_404(session_id)
+
+        res = supabase.table(SESSIONS_TABLE).update({"active": False}).eq("id", session_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Session not found")
+
         return {"ok": True, "id": session_id, "active": False}
     except HTTPException:
         raise
@@ -621,7 +586,7 @@ def deactivate_session(session_id: str):
 
 
 # ==========================================================
-# SESSION ENTRIES (session_platform_entries) FK -> shift_sessions
+# SESSION ENTRIES (session_platform_entries)
 # ==========================================================
 class SessionEntryUpsert(BaseModel):
     platform_id: str
@@ -640,8 +605,7 @@ class SessionEntryUpsert(BaseModel):
 @app.get("/sessions/{session_id}/entries")
 def list_session_entries(session_id: str, include_inactive: bool = False):
     try:
-        # must exist in shift_sessions (FK domain)
-        _ensure_shift_session_exists(session_id)
+        _get_session_or_404(session_id)
 
         q = supabase.table("session_platform_entries").select("*").eq("session_id", session_id)
         if not include_inactive:
@@ -662,8 +626,7 @@ def upsert_session_entry(
     allow_update_locked: bool = Query(False, description="If true, allows updating locked_in=true rows"),
 ):
     try:
-        # ✅ make sure FK target exists
-        _ensure_shift_session_exists(session_id)
+        _get_session_or_404(session_id)
         _get_platform_or_404(payload.platform_id)
 
         existing = (
@@ -696,7 +659,6 @@ def upsert_session_entry(
                 .eq("platform_id", payload.platform_id)
                 .execute()
             )
-
             if not res.data:
                 raise HTTPException(status_code=500, detail="Update failed: empty response")
             return res.data[0]
@@ -729,7 +691,7 @@ def upsert_session_entry(
 @app.delete("/sessions/{session_id}/entries/{platform_id}")
 def deactivate_session_entry(session_id: str, platform_id: str):
     try:
-        _ensure_shift_session_exists(session_id)
+        _get_session_or_404(session_id)
         _get_platform_or_404(platform_id)
 
         res = (
@@ -824,8 +786,8 @@ def deactivate_room(room_id: str):
 # ROOM ASSIGNMENTS (room_assignments)
 # ==========================================================
 class RoomAssignmentCreate(BaseModel):
-    assignment_date: Optional[date] = None  # YYYY-MM-DD. Si viene None -> hoy
-    shift_slot: str  # morning | afternoon | night
+    assignment_date: Optional[date] = None
+    shift_slot: str
     model_id: str
     room_id: str
     active: bool = True
@@ -877,9 +839,7 @@ def create_assignment(payload: RoomAssignmentCreate):
 
         data = payload.model_dump()
         if data.get("assignment_date") is None:
-            data["assignment_date"] = str(date.today())
-        else:
-            data["assignment_date"] = str(data["assignment_date"])
+            data["assignment_date"] = date.today()
 
         res = supabase.table("room_assignments").insert(data).execute()
         if not res.data:

@@ -60,6 +60,18 @@ def _is_unique_violation(e: Exception) -> bool:
     return ("duplicate" in msg) or ("unique" in msg) or ("violates unique constraint" in msg)
 
 
+def _dump_json(obj: BaseModel) -> Dict[str, Any]:
+    """
+    Pydantic v2: convierte tipos no JSON (date, datetime, etc.) a JSON-friendly.
+    Esto evita el error: "Object of type date is not JSON serializable".
+    """
+    return obj.model_dump(mode="json")
+
+
+def _dump_json_exclude_none(obj: BaseModel) -> Dict[str, Any]:
+    return obj.model_dump(mode="json", exclude_none=True)
+
+
 def _get_model_or_404(model_id: str) -> Dict[str, Any]:
     res = supabase.table("models").select("id, active").eq("id", model_id).single().execute()
     if not res.data:
@@ -147,7 +159,7 @@ def list_models():
 def create_model(payload: ModelCreate):
     try:
         _validate_turn_type(payload.turn_type)
-        res = supabase.table("models").insert(payload.model_dump()).execute()
+        res = supabase.table("models").insert(_dump_json(payload)).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
@@ -171,7 +183,7 @@ def get_model(model_id: str):
 @app.patch("/models/{model_id}")
 def update_model(model_id: str, payload: ModelUpdate):
     try:
-        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        data = _dump_json_exclude_none(payload)
         if "turn_type" in data:
             _validate_turn_type(str(data["turn_type"]))
         if not data:
@@ -246,7 +258,7 @@ def list_platforms():
 @app.post("/platforms")
 def create_platform(payload: PlatformCreate):
     try:
-        res = supabase.table("platforms").insert(payload.model_dump()).execute()
+        res = supabase.table("platforms").insert(_dump_json(payload)).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
@@ -276,7 +288,7 @@ def get_platform(platform_id: str):
 @app.patch("/platforms/{platform_id}")
 def update_platform(platform_id: str, payload: PlatformUpdate):
     try:
-        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        data = _dump_json_exclude_none(payload)
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -444,7 +456,7 @@ def update_model_platform(model_id: str, platform_id: str, payload: ModelPlatfor
         _get_model_or_404(model_id)
         _get_platform_or_404(platform_id)
 
-        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        data = _dump_json_exclude_none(payload)
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -549,7 +561,7 @@ def create_session(payload: SessionCreate):
         _get_model_or_404(payload.model_id)
         _validate_turn_type(payload.turn_type)
 
-        res = supabase.table("sessions").insert(payload.model_dump()).execute()
+        res = supabase.table("sessions").insert(_dump_json(payload)).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
@@ -576,7 +588,7 @@ def update_session(session_id: str, payload: SessionUpdate):
     try:
         _get_session_or_404(session_id)
 
-        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        data = _dump_json_exclude_none(payload)
         if "turn_type" in data:
             _validate_turn_type(str(data["turn_type"]))
         if not data:
@@ -680,7 +692,7 @@ def upsert_session_entry(
             .execute()
         ).data
 
-        data = payload.model_dump()
+        data = _dump_json(payload)
         data["session_id"] = session_id
 
         if existing:
@@ -792,7 +804,7 @@ def list_rooms(include_inactive: bool = Query(False)):
 @app.post("/rooms")
 def create_room(payload: RoomCreate):
     try:
-        res = supabase.table("rooms").insert(payload.model_dump()).execute()
+        res = supabase.table("rooms").insert(_dump_json(payload)).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
@@ -805,7 +817,7 @@ def update_room(room_id: str, payload: RoomUpdate):
     try:
         _get_room_or_404(room_id)
 
-        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        data = _dump_json_exclude_none(payload)
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -895,9 +907,9 @@ def create_assignment(payload: RoomAssignmentCreate):
         _get_room_or_404(payload.room_id)
         _validate_shift_slot(payload.shift_slot)
 
-        data = payload.model_dump()
+        data = _dump_json(payload)  # <-- clave: date ya viene como "YYYY-MM-DD"
         if data.get("assignment_date") is None:
-            data["assignment_date"] = date.today()
+            data["assignment_date"] = str(date.today())
 
         res = supabase.table("room_assignments").insert(data).execute()
         if not res.data:
@@ -925,7 +937,7 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
         if not existing.data:
             raise HTTPException(status_code=404, detail="Assignment not found")
 
-        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        data = _dump_json_exclude_none(payload)
         if "shift_slot" in data:
             _validate_shift_slot(str(data["shift_slot"]))
         if "room_id" in data:

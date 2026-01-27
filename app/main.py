@@ -15,7 +15,7 @@ app = FastAPI(title="Closer CRM API")
 
 
 # =========================
-# CORS (frontend en localhost:3000)
+# CORS
 # =========================
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
@@ -60,16 +60,14 @@ def _is_unique_violation(e: Exception) -> bool:
     return ("duplicate" in msg) or ("unique" in msg) or ("violates unique constraint" in msg)
 
 
-def _dump_json(obj: BaseModel) -> Dict[str, Any]:
-    """
-    Pydantic v2: convierte tipos no JSON (date, datetime, etc.) a JSON-friendly.
-    Esto evita el error: "Object of type date is not JSON serializable".
-    """
-    return obj.model_dump(mode="json")
+def _validate_turn_type(turn_type: str) -> None:
+    if turn_type not in ("day", "night"):
+        raise HTTPException(status_code=400, detail="turn_type must be 'day' or 'night'")
 
 
-def _dump_json_exclude_none(obj: BaseModel) -> Dict[str, Any]:
-    return obj.model_dump(mode="json", exclude_none=True)
+def _validate_shift_slot(shift_slot: str) -> None:
+    if shift_slot not in ("morning", "afternoon", "night"):
+        raise HTTPException(status_code=400, detail="shift_slot must be 'morning', 'afternoon', or 'night'")
 
 
 def _get_model_or_404(model_id: str) -> Dict[str, Any]:
@@ -86,13 +84,6 @@ def _get_platform_or_404(platform_id: str) -> Dict[str, Any]:
     return res.data
 
 
-def _get_session_or_404(session_id: str) -> Dict[str, Any]:
-    res = supabase.table("sessions").select("*").eq("id", session_id).single().execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return res.data
-
-
 def _get_room_or_404(room_id: str) -> Dict[str, Any]:
     res = supabase.table("rooms").select("id, active").eq("id", room_id).single().execute()
     if not res.data:
@@ -100,14 +91,71 @@ def _get_room_or_404(room_id: str) -> Dict[str, Any]:
     return res.data
 
 
-def _validate_turn_type(turn_type: str) -> None:
-    if turn_type not in ("day", "night"):
-        raise HTTPException(status_code=400, detail="turn_type must be 'day' or 'night'")
+# -------------------------
+# IMPORTANT: sessions now live in shift_sessions (FK requirement)
+# -------------------------
+def _get_shift_session_or_404(session_id: str) -> Dict[str, Any]:
+    res = supabase.table("shift_sessions").select("*").eq("id", session_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return res.data
 
 
-def _validate_shift_slot(shift_slot: str) -> None:
-    if shift_slot not in ("morning", "afternoon", "night"):
-        raise HTTPException(status_code=400, detail="shift_slot must be 'morning', 'afternoon', or 'night'")
+def _get_session_or_404_compat(session_id: str) -> Dict[str, Any]:
+    """
+    Compat: try shift_sessions first, fallback to sessions.
+    """
+    try:
+        res = supabase.table("shift_sessions").select("*").eq("id", session_id).single().execute()
+        if res.data:
+            return res.data
+    except Exception:
+        pass
+
+    res2 = supabase.table("sessions").select("*").eq("id", session_id).single().execute()
+    if not res2.data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return res2.data
+
+
+def _ensure_shift_session_exists(session_id: str) -> None:
+    """
+    Guarantees that shift_sessions has the session_id required by FK from session_platform_entries.
+    If not present, tries to copy from legacy 'sessions'.
+    """
+    try:
+        exists = supabase.table("shift_sessions").select("id").eq("id", session_id).single().execute()
+        if exists.data:
+            return
+    except Exception:
+        # if table doesn't exist or single() fails, let it raise below when used
+        pass
+
+    # fallback: look in legacy sessions and backfill into shift_sessions
+    legacy = supabase.table("sessions").select("*").eq("id", session_id).single().execute()
+    if not legacy.data:
+        raise HTTPException(status_code=404, detail="Session not found (neither shift_sessions nor sessions)")
+
+    row = legacy.data
+
+    # Build insert payload for shift_sessions.
+    # Assumption: shift_sessions has same columns as sessions (id, model_id, session_date, turn_type, notes, active).
+    # If your table has more columns, we can extend later.
+    ins = {
+        "id": row.get("id"),
+        "model_id": row.get("model_id"),
+        "session_date": str(row.get("session_date")) if row.get("session_date") else None,
+        "turn_type": row.get("turn_type"),
+        "notes": row.get("notes"),
+        "active": True if row.get("active") is None else bool(row.get("active")),
+    }
+
+    try:
+        supabase.table("shift_sessions").insert(ins).execute()
+    except Exception as e:
+        # if already exists due to race, ignore; else raise
+        if not _is_unique_violation(e):
+            raise HTTPException(status_code=500, detail=f"Could not backfill shift_sessions: {str(e)}")
 
 
 # ==========================================================
@@ -144,13 +192,8 @@ class ModelUpdate(BaseModel):
 @app.get("/models")
 def list_models():
     try:
-        res = (
-            supabase.table("models")
-            .select("*")
-            .order("created_at", desc=True)
-            .execute()
-        )
-        return res.data
+        res = supabase.table("models").select("*").order("created_at", desc=True).execute()
+        return res.data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -159,7 +202,7 @@ def list_models():
 def create_model(payload: ModelCreate):
     try:
         _validate_turn_type(payload.turn_type)
-        res = supabase.table("models").insert(_dump_json(payload)).execute()
+        res = supabase.table("models").insert(payload.model_dump()).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
@@ -183,17 +226,15 @@ def get_model(model_id: str):
 @app.patch("/models/{model_id}")
 def update_model(model_id: str, payload: ModelUpdate):
     try:
-        data = _dump_json_exclude_none(payload)
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
         if "turn_type" in data:
             _validate_turn_type(str(data["turn_type"]))
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
         res = supabase.table("models").update(data).eq("id", model_id).execute()
-
         if not res.data:
             raise HTTPException(status_code=404, detail="Model not found")
-
         return res.data[0]
     except HTTPException:
         raise
@@ -203,20 +244,10 @@ def update_model(model_id: str, payload: ModelUpdate):
 
 @app.delete("/models/{model_id}")
 def deactivate_model(model_id: str):
-    """
-    Soft delete: no borramos el registro, solo lo dejamos active=false.
-    """
     try:
-        res = (
-            supabase.table("models")
-            .update({"active": False})
-            .eq("id", model_id)
-            .execute()
-        )
-
+        res = supabase.table("models").update({"active": False}).eq("id", model_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Model not found")
-
         return {"ok": True, "id": model_id, "active": False}
     except HTTPException:
         raise
@@ -244,13 +275,8 @@ class PlatformUpdate(BaseModel):
 @app.get("/platforms")
 def list_platforms():
     try:
-        res = (
-            supabase.table("platforms")
-            .select("*")
-            .order("name", desc=False)
-            .execute()
-        )
-        return res.data
+        res = supabase.table("platforms").select("*").order("name", desc=False).execute()
+        return res.data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -258,7 +284,7 @@ def list_platforms():
 @app.post("/platforms")
 def create_platform(payload: PlatformCreate):
     try:
-        res = supabase.table("platforms").insert(_dump_json(payload)).execute()
+        res = supabase.table("platforms").insert(payload.model_dump()).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
@@ -269,13 +295,7 @@ def create_platform(payload: PlatformCreate):
 @app.get("/platforms/{platform_id}")
 def get_platform(platform_id: str):
     try:
-        res = (
-            supabase.table("platforms")
-            .select("*")
-            .eq("id", platform_id)
-            .single()
-            .execute()
-        )
+        res = supabase.table("platforms").select("*").eq("id", platform_id).single().execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Platform not found")
         return res.data
@@ -288,20 +308,13 @@ def get_platform(platform_id: str):
 @app.patch("/platforms/{platform_id}")
 def update_platform(platform_id: str, payload: PlatformUpdate):
     try:
-        data = _dump_json_exclude_none(payload)
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
-        res = (
-            supabase.table("platforms")
-            .update(data)
-            .eq("id", platform_id)
-            .execute()
-        )
-
+        res = supabase.table("platforms").update(data).eq("id", platform_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Platform not found")
-
         return res.data[0]
     except HTTPException:
         raise
@@ -311,20 +324,10 @@ def update_platform(platform_id: str, payload: PlatformUpdate):
 
 @app.delete("/platforms/{platform_id}")
 def deactivate_platform(platform_id: str):
-    """
-    Soft delete: no borramos el registro, solo lo dejamos active=false.
-    """
     try:
-        res = (
-            supabase.table("platforms")
-            .update({"active": False})
-            .eq("id", platform_id)
-            .execute()
-        )
-
+        res = supabase.table("platforms").update({"active": False}).eq("id", platform_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Platform not found")
-
         return {"ok": True, "id": platform_id, "active": False}
     except HTTPException:
         raise
@@ -356,9 +359,6 @@ def list_model_platforms(
     model_id: str,
     include_inactive: bool = Query(False, description="If true, includes inactive relations"),
 ):
-    """
-    Lista plataformas asignadas a una modelo (incluye info de la plataforma para UI).
-    """
     try:
         _get_model_or_404(model_id)
 
@@ -412,9 +412,6 @@ def list_model_platforms(
 
 @app.post("/models/{model_id}/platforms")
 def add_platform_to_model(model_id: str, payload: ModelPlatformCreate):
-    """
-    Asigna una plataforma a una modelo (con overrides opcionales).
-    """
     try:
         m = _get_model_or_404(model_id)
         if m.get("active") is False:
@@ -449,14 +446,11 @@ def add_platform_to_model(model_id: str, payload: ModelPlatformCreate):
 
 @app.patch("/models/{model_id}/platforms/{platform_id}")
 def update_model_platform(model_id: str, platform_id: str, payload: ModelPlatformUpdate):
-    """
-    Edita overrides / activa-desactiva la relación modelo ↔ plataforma.
-    """
     try:
         _get_model_or_404(model_id)
         _get_platform_or_404(platform_id)
 
-        data = _dump_json_exclude_none(payload)
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -481,9 +475,6 @@ def update_model_platform(model_id: str, platform_id: str, payload: ModelPlatfor
 
 @app.delete("/models/{model_id}/platforms/{platform_id}")
 def deactivate_model_platform(model_id: str, platform_id: str):
-    """
-    Soft delete de la relación: active=false
-    """
     try:
         _get_model_or_404(model_id)
         _get_platform_or_404(platform_id)
@@ -508,7 +499,7 @@ def deactivate_model_platform(model_id: str, platform_id: str):
 
 
 # ==========================================================
-# SESSIONS (sessions)
+# SESSIONS (shift_sessions is canonical)
 # ==========================================================
 class SessionCreate(BaseModel):
     model_id: str
@@ -531,12 +522,8 @@ def list_sessions(
     model_id: Optional[str] = None,
     include_inactive: bool = False,
 ):
-    """
-    Lista sesiones. Filtra por fecha y/o model_id.
-    Por defecto devuelve active=true, a menos que include_inactive=true.
-    """
     try:
-        q = supabase.table("sessions").select("*").order("session_date", desc=True)
+        q = supabase.table("shift_sessions").select("*").order("session_date", desc=True)
 
         if session_date:
             q = q.eq("session_date", str(session_date))
@@ -553,18 +540,27 @@ def list_sessions(
 
 @app.post("/sessions")
 def create_session(payload: SessionCreate):
-    """
-    Crea una sesión (model_id + session_date + turn_type).
-    En BD suele existir unique(model_id, session_date, turn_type).
-    """
     try:
         _get_model_or_404(payload.model_id)
         _validate_turn_type(payload.turn_type)
 
-        res = supabase.table("sessions").insert(_dump_json(payload)).execute()
+        data = payload.model_dump()
+        # ensure JSON-serializable date
+        data["session_date"] = str(payload.session_date)
+
+        res = supabase.table("shift_sessions").insert(data).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
-        return res.data[0]
+
+        created = res.data[0]
+
+        # (Optional) also mirror into legacy sessions to keep old data consistent
+        try:
+            supabase.table("sessions").insert({**data, "id": created.get("id")}).execute()
+        except Exception:
+            pass
+
+        return created
     except HTTPException:
         raise
     except Exception as e:
@@ -576,7 +572,7 @@ def create_session(payload: SessionCreate):
 @app.get("/sessions/{session_id}")
 def get_session(session_id: str):
     try:
-        return _get_session_or_404(session_id)
+        return _get_session_or_404_compat(session_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -586,15 +582,18 @@ def get_session(session_id: str):
 @app.patch("/sessions/{session_id}")
 def update_session(session_id: str, payload: SessionUpdate):
     try:
-        _get_session_or_404(session_id)
+        # prefer shift_sessions
+        _get_shift_session_or_404(session_id)
 
-        data = _dump_json_exclude_none(payload)
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
         if "turn_type" in data:
             _validate_turn_type(str(data["turn_type"]))
+        if "session_date" in data and data["session_date"] is not None:
+            data["session_date"] = str(data["session_date"])
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
-        res = supabase.table("sessions").update(data).eq("id", session_id).execute()
+        res = supabase.table("shift_sessions").update(data).eq("id", session_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Session not found")
 
@@ -609,16 +608,11 @@ def update_session(session_id: str, payload: SessionUpdate):
 
 @app.delete("/sessions/{session_id}")
 def deactivate_session(session_id: str):
-    """
-    Soft delete: sessions.active=false
-    """
     try:
-        _get_session_or_404(session_id)
-
-        res = supabase.table("sessions").update({"active": False}).eq("id", session_id).execute()
+        _get_shift_session_or_404(session_id)
+        res = supabase.table("shift_sessions").update({"active": False}).eq("id", session_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Session not found")
-
         return {"ok": True, "id": session_id, "active": False}
     except HTTPException:
         raise
@@ -627,7 +621,7 @@ def deactivate_session(session_id: str):
 
 
 # ==========================================================
-# SESSION ENTRIES (session_platform_entries)  <-- columnas reales
+# SESSION ENTRIES (session_platform_entries) FK -> shift_sessions
 # ==========================================================
 class SessionEntryUpsert(BaseModel):
     platform_id: str
@@ -644,15 +638,10 @@ class SessionEntryUpsert(BaseModel):
 
 
 @app.get("/sessions/{session_id}/entries")
-def list_session_entries(
-    session_id: str,
-    include_inactive: bool = False,
-):
-    """
-    Lista entries de una sesión.
-    """
+def list_session_entries(session_id: str, include_inactive: bool = False):
     try:
-        _get_session_or_404(session_id)
+        # must exist in shift_sessions (FK domain)
+        _ensure_shift_session_exists(session_id)
 
         q = supabase.table("session_platform_entries").select("*").eq("session_id", session_id)
         if not include_inactive:
@@ -672,18 +661,11 @@ def upsert_session_entry(
     payload: SessionEntryUpsert,
     allow_update_locked: bool = Query(False, description="If true, allows updating locked_in=true rows"),
 ):
-    """
-    Upsert por (session_id, platform_id).
-    - Si ya existe, actualiza.
-    - Si no existe, crea.
-
-    Si la fila está locked_in=true y allow_update_locked=false, bloquea el update.
-    """
     try:
-        _get_session_or_404(session_id)
+        # ✅ make sure FK target exists
+        _ensure_shift_session_exists(session_id)
         _get_platform_or_404(payload.platform_id)
 
-        # ¿Existe ya?
         existing = (
             supabase.table("session_platform_entries")
             .select("*")
@@ -692,7 +674,7 @@ def upsert_session_entry(
             .execute()
         ).data
 
-        data = _dump_json(payload)
+        data = payload.model_dump()
         data["session_id"] = session_id
 
         if existing:
@@ -700,9 +682,7 @@ def upsert_session_entry(
             if row.get("locked_in") is True and not allow_update_locked:
                 raise HTTPException(status_code=400, detail="Entry is locked_in and cannot be updated")
 
-            # update solo campos no-None
             upd = {k: v for k, v in data.items() if v is not None}
-            # nunca actualizar session_id/platform_id por accidente
             upd.pop("session_id", None)
             upd.pop("platform_id", None)
 
@@ -721,7 +701,6 @@ def upsert_session_entry(
                 raise HTTPException(status_code=500, detail="Update failed: empty response")
             return res.data[0]
 
-        # insert
         ins = {
             "session_id": session_id,
             "platform_id": payload.platform_id,
@@ -743,18 +722,14 @@ def upsert_session_entry(
         raise
     except Exception as e:
         if _is_unique_violation(e):
-            # si por alguna razón hay unique (session_id, platform_id), intentaron crear repetido
             raise HTTPException(status_code=409, detail="Entry already exists for this session/platform")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/sessions/{session_id}/entries/{platform_id}")
 def deactivate_session_entry(session_id: str, platform_id: str):
-    """
-    Soft delete: entry.active=false (por session_id+platform_id)
-    """
     try:
-        _get_session_or_404(session_id)
+        _ensure_shift_session_exists(session_id)
         _get_platform_or_404(platform_id)
 
         res = (
@@ -804,7 +779,7 @@ def list_rooms(include_inactive: bool = Query(False)):
 @app.post("/rooms")
 def create_room(payload: RoomCreate):
     try:
-        res = supabase.table("rooms").insert(_dump_json(payload)).execute()
+        res = supabase.table("rooms").insert(payload.model_dump()).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
@@ -817,7 +792,7 @@ def update_room(room_id: str, payload: RoomUpdate):
     try:
         _get_room_or_404(room_id)
 
-        data = _dump_json_exclude_none(payload)
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -870,9 +845,6 @@ def list_assignments(
     model_id: Optional[str] = None,
     include_inactive: bool = False,
 ):
-    """
-    Lista asignaciones de room por fecha y turno operativo.
-    """
     try:
         q = supabase.table("room_assignments").select("*").order("created_at", desc=False)
 
@@ -898,18 +870,16 @@ def list_assignments(
 
 @app.post("/assignments")
 def create_assignment(payload: RoomAssignmentCreate):
-    """
-    Crea una asignación diaria para una modelo en un room, por turno operativo.
-    Recomendado en DB: unique(assignment_date, shift_slot, model_id)
-    """
     try:
         _get_model_or_404(payload.model_id)
         _get_room_or_404(payload.room_id)
         _validate_shift_slot(payload.shift_slot)
 
-        data = _dump_json(payload)  # <-- clave: date ya viene como "YYYY-MM-DD"
+        data = payload.model_dump()
         if data.get("assignment_date") is None:
             data["assignment_date"] = str(date.today())
+        else:
+            data["assignment_date"] = str(data["assignment_date"])
 
         res = supabase.table("room_assignments").insert(data).execute()
         if not res.data:
@@ -926,7 +896,6 @@ def create_assignment(payload: RoomAssignmentCreate):
 @app.patch("/assignments/{assignment_id}")
 def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
     try:
-        # Validar existencia
         existing = (
             supabase.table("room_assignments")
             .select("*")
@@ -937,7 +906,7 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
         if not existing.data:
             raise HTTPException(status_code=404, detail="Assignment not found")
 
-        data = _dump_json_exclude_none(payload)
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
         if "shift_slot" in data:
             _validate_shift_slot(str(data["shift_slot"]))
         if "room_id" in data:

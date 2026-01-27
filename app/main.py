@@ -4,7 +4,7 @@ from datetime import date
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from supabase import create_client
 
 
@@ -15,12 +15,11 @@ app = FastAPI(title="Closer CRM API")
 
 
 # =========================
-# CORS
+# CORS (frontend en localhost:3000)
 # =========================
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    # "https://tu-frontend.vercel.app",
 ]
 
 app.add_middleware(
@@ -81,50 +80,61 @@ def _get_room_or_404(room_id: str) -> Dict[str, Any]:
     return res.data
 
 
+def _get_shift_session_or_404(session_id: str) -> Dict[str, Any]:
+    res = supabase.table("shift_sessions").select("*").eq("id", session_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return res.data
+
+
 def _validate_turn_type(turn_type: str) -> None:
     if turn_type not in ("day", "night"):
         raise HTTPException(status_code=400, detail="turn_type must be 'day' or 'night'")
 
 
-def _validate_shift_slot(shift_slot: str) -> None:
-    if shift_slot not in ("morning", "afternoon", "night"):
-        raise HTTPException(status_code=400, detail="shift_slot must be 'morning', 'afternoon', or 'night'")
+def _validate_shift(shift: str) -> None:
+    if shift not in ("morning", "afternoon", "night"):
+        raise HTTPException(status_code=400, detail="shift must be 'morning', 'afternoon', or 'night'")
 
 
-# --- IMPORTANT: sessions table mapping ---
-# Your DB uses shift_sessions with a date column named shift_date.
-# Frontend expects "session_date". We keep API stable by mapping shift_date <-> session_date.
-
-SESSIONS_TABLE = "shift_sessions"
-SESSIONS_DATE_COL = "shift_date"  # DB column name
+def _turn_type_from_shift(shift: str) -> str:
+    return "night" if shift == "night" else "day"
 
 
-def _session_db_to_api(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert DB row (shift_sessions) to API shape (session_date)."""
-    if not row:
-        return row
-    out = dict(row)
-    if SESSIONS_DATE_COL in out:
-        out["session_date"] = out.get(SESSIONS_DATE_COL)
-    # Do not leak internal name if you don't want; but harmless to keep shift_date too
-    # out.pop(SESSIONS_DATE_COL, None)
-    return out
+def _default_shift_from_turn_type(turn_type: str) -> str:
+    # si el frontend manda day/no shift, asumimos morning
+    return "night" if turn_type == "night" else "morning"
 
 
-def _session_api_to_db(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert API payload (session_date) to DB shape (shift_date)."""
-    data = dict(payload)
-    if "session_date" in data:
-        data[SESSIONS_DATE_COL] = data["session_date"]
-        data.pop("session_date", None)
-    return data
+def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift: str) -> Optional[Dict[str, Any]]:
+    """
+    Busca la asignación activa de room para esa modelo + fecha + shift_slot.
+    Si no existe, intenta fallback:
+      - si shift=morning: busca afternoon
+      - si shift=afternoon: busca morning
+      - si shift=day (no aplica) etc...
+    """
+    q = (
+        supabase.table("room_assignments")
+        .select("*")
+        .eq("model_id", model_id)
+        .eq("assignment_date", str(assignment_date))
+        .eq("active", True)
+    )
 
+    # 1) intento exacto
+    exact = q.eq("shift_slot", shift).execute().data
+    if exact:
+        return exact[0]
 
-def _get_session_or_404(session_id: str) -> Dict[str, Any]:
-    res = supabase.table(SESSIONS_TABLE).select("*").eq("id", session_id).single().execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return _session_db_to_api(res.data)
+    # 2) fallback dentro del día
+    if shift in ("morning", "afternoon"):
+        alt = "afternoon" if shift == "morning" else "morning"
+        alt_res = q.eq("shift_slot", alt).execute().data
+        if alt_res:
+            return alt_res[0]
+
+    return None
 
 
 # ==========================================================
@@ -162,7 +172,7 @@ class ModelUpdate(BaseModel):
 def list_models():
     try:
         res = supabase.table("models").select("*").order("created_at", desc=True).execute()
-        return res.data
+        return res.data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -245,7 +255,7 @@ class PlatformUpdate(BaseModel):
 def list_platforms():
     try:
         res = supabase.table("platforms").select("*").order("name", desc=False).execute()
-        return res.data
+        return res.data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -324,10 +334,7 @@ class ModelPlatformUpdate(BaseModel):
 
 
 @app.get("/models/{model_id}/platforms")
-def list_model_platforms(
-    model_id: str,
-    include_inactive: bool = Query(False, description="If true, includes inactive relations"),
-):
+def list_model_platforms(model_id: str, include_inactive: bool = Query(False)):
     try:
         _get_model_or_404(model_id)
 
@@ -468,7 +475,7 @@ def deactivate_model_platform(model_id: str, platform_id: str):
 
 
 # ==========================================================
-# SESSIONS (shift_sessions)  <-- FIXED
+# SESSIONS (API contract)  -> backed by shift_sessions table
 # ==========================================================
 class SessionCreate(BaseModel):
     model_id: str
@@ -491,51 +498,128 @@ def list_sessions(
     model_id: Optional[str] = None,
     include_inactive: bool = False,
 ):
+    """
+    Devuelve sesiones desde shift_sessions pero con campos esperados por frontend:
+    - session_date (mapea a shift_sessions.date)
+    - turn_type (deriva desde shift_sessions.shift)
+    """
     try:
-        # NOTE: DB uses shift_date, not session_date
-        q = supabase.table(SESSIONS_TABLE).select("*").order(SESSIONS_DATE_COL, desc=True)
+        q = supabase.table("shift_sessions").select("*").order("date", desc=True)
 
         if session_date:
-            q = q.eq(SESSIONS_DATE_COL, str(session_date))
+            q = q.eq("date", str(session_date))
         if model_id:
             q = q.eq("model_id", model_id)
-        if not include_inactive:
-            q = q.eq("active", True)
 
-        res = q.execute()
-        rows = res.data or []
-        return [_session_db_to_api(r) for r in rows]
+        # "inactive" en shift_sessions lo interpretamos por status
+        # si include_inactive=False, ocultamos status='deleted'
+        if not include_inactive:
+            q = q.neq("status", "deleted")
+
+        rows = q.execute().data or []
+
+        out = []
+        for r in rows:
+            shift = r.get("shift")
+            out.append(
+                {
+                    "id": r.get("id"),
+                    "model_id": r.get("model_id"),
+                    "room_id": r.get("room_id"),
+                    "shift": shift,
+                    "session_date": r.get("date"),
+                    "turn_type": _turn_type_from_shift(shift) if shift else None,
+                    "checkin_at": r.get("checkin_at"),
+                    "checkout_at": r.get("checkout_at"),
+                    "notes": r.get("notes"),
+                    "status": r.get("status"),
+                    "active": (r.get("status") != "deleted"),
+                }
+            )
+        return out
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sessions")
 def create_session(payload: SessionCreate):
+    """
+    Crea sesión en shift_sessions, auto-resolviendo:
+      - shift: desde turn_type (day->morning por defecto, night->night)
+      - room_id: desde room_assignments (model_id + date + shift_slot)
+    """
     try:
         _get_model_or_404(payload.model_id)
         _validate_turn_type(payload.turn_type)
 
-        data = _session_api_to_db(payload.model_dump())
-        # ensure date exists
-        if data.get(SESSIONS_DATE_COL) is None:
-            data[SESSIONS_DATE_COL] = date.today()
+        desired_shift = _default_shift_from_turn_type(payload.turn_type)
 
-        res = supabase.table(SESSIONS_TABLE).insert(data).execute()
+        # buscar room_id en asignaciones
+        asg = _find_assignment_room_for_model(payload.model_id, payload.session_date, desired_shift)
+        if not asg or not asg.get("room_id"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"No hay asignación activa (room_assignments) para model_id={payload.model_id} date={payload.session_date} shift={desired_shift}",
+            )
+
+        room_id = asg["room_id"]
+        _get_room_or_404(room_id)
+
+        ins = {
+            "model_id": payload.model_id,
+            "room_id": room_id,
+            "shift": desired_shift,
+            "date": str(payload.session_date),
+            "notes": payload.notes,
+            "status": "open",
+        }
+
+        res = supabase.table("shift_sessions").insert(ins).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
-        return _session_db_to_api(res.data[0])
+
+        r = res.data[0]
+        return {
+            "id": r.get("id"),
+            "model_id": r.get("model_id"),
+            "room_id": r.get("room_id"),
+            "shift": r.get("shift"),
+            "session_date": r.get("date"),
+            "turn_type": _turn_type_from_shift(r.get("shift")),
+            "checkin_at": r.get("checkin_at"),
+            "checkout_at": r.get("checkout_at"),
+            "notes": r.get("notes"),
+            "status": r.get("status"),
+            "active": (r.get("status") != "deleted"),
+        }
+
     except HTTPException:
         raise
     except Exception as e:
         if _is_unique_violation(e):
-            raise HTTPException(status_code=409, detail="Session already exists for that model/date/turn")
+            raise HTTPException(status_code=409, detail="Session already exists (unique constraint)")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/sessions/{session_id}")
 def get_session(session_id: str):
     try:
-        return _get_session_or_404(session_id)
+        r = _get_shift_session_or_404(session_id)
+        shift = r.get("shift")
+        return {
+            "id": r.get("id"),
+            "model_id": r.get("model_id"),
+            "room_id": r.get("room_id"),
+            "shift": shift,
+            "session_date": r.get("date"),
+            "turn_type": _turn_type_from_shift(shift) if shift else None,
+            "checkin_at": r.get("checkin_at"),
+            "checkout_at": r.get("checkout_at"),
+            "notes": r.get("notes"),
+            "status": r.get("status"),
+            "active": (r.get("status") != "deleted"),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -544,40 +628,71 @@ def get_session(session_id: str):
 
 @app.patch("/sessions/{session_id}")
 def update_session(session_id: str, payload: SessionUpdate):
+    """
+    Update en shift_sessions (mapeos):
+      - session_date -> date
+      - turn_type -> shift (day->morning, night->night)   (si quieres soportar afternoon explícito, lo hacemos luego)
+      - active=false -> status='deleted'
+    """
     try:
-        _get_session_or_404(session_id)
+        existing = _get_shift_session_or_404(session_id)
 
-        raw = {k: v for k, v in payload.model_dump().items() if v is not None}
-        if "turn_type" in raw:
-            _validate_turn_type(str(raw["turn_type"]))
-        if not raw:
+        data_in = payload.model_dump()
+        upd: Dict[str, Any] = {}
+
+        if data_in.get("session_date") is not None:
+            upd["date"] = str(data_in["session_date"])
+
+        if data_in.get("turn_type") is not None:
+            _validate_turn_type(str(data_in["turn_type"]))
+            upd["shift"] = _default_shift_from_turn_type(str(data_in["turn_type"]))
+
+        if data_in.get("notes") is not None:
+            upd["notes"] = data_in["notes"]
+
+        if data_in.get("active") is not None:
+            # active false -> deleted
+            upd["status"] = "deleted" if data_in["active"] is False else (existing.get("status") or "open")
+
+        if not upd:
             raise HTTPException(status_code=400, detail="No fields to update")
 
-        data = _session_api_to_db(raw)
-
-        res = supabase.table(SESSIONS_TABLE).update(data).eq("id", session_id).execute()
+        res = supabase.table("shift_sessions").update(upd).eq("id", session_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        return _session_db_to_api(res.data[0])
+        r = res.data[0]
+        shift = r.get("shift")
+        return {
+            "id": r.get("id"),
+            "model_id": r.get("model_id"),
+            "room_id": r.get("room_id"),
+            "shift": shift,
+            "session_date": r.get("date"),
+            "turn_type": _turn_type_from_shift(shift) if shift else None,
+            "checkin_at": r.get("checkin_at"),
+            "checkout_at": r.get("checkout_at"),
+            "notes": r.get("notes"),
+            "status": r.get("status"),
+            "active": (r.get("status") != "deleted"),
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        if _is_unique_violation(e):
-            raise HTTPException(status_code=409, detail="Session already exists for that model/date/turn")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/sessions/{session_id}")
 def deactivate_session(session_id: str):
+    """
+    Soft delete: status='deleted'
+    """
     try:
-        _get_session_or_404(session_id)
-
-        res = supabase.table(SESSIONS_TABLE).update({"active": False}).eq("id", session_id).execute()
+        _get_shift_session_or_404(session_id)
+        res = supabase.table("shift_sessions").update({"status": "deleted"}).eq("id", session_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Session not found")
-
         return {"ok": True, "id": session_id, "active": False}
     except HTTPException:
         raise
@@ -586,7 +701,7 @@ def deactivate_session(session_id: str):
 
 
 # ==========================================================
-# SESSION ENTRIES (session_platform_entries)
+# SESSION ENTRIES (session_platform_entries)  <-- columnas reales
 # ==========================================================
 class SessionEntryUpsert(BaseModel):
     platform_id: str
@@ -605,7 +720,7 @@ class SessionEntryUpsert(BaseModel):
 @app.get("/sessions/{session_id}/entries")
 def list_session_entries(session_id: str, include_inactive: bool = False):
     try:
-        _get_session_or_404(session_id)
+        _get_shift_session_or_404(session_id)
 
         q = supabase.table("session_platform_entries").select("*").eq("session_id", session_id)
         if not include_inactive:
@@ -623,10 +738,10 @@ def list_session_entries(session_id: str, include_inactive: bool = False):
 def upsert_session_entry(
     session_id: str,
     payload: SessionEntryUpsert,
-    allow_update_locked: bool = Query(False, description="If true, allows updating locked_in=true rows"),
+    allow_update_locked: bool = Query(False),
 ):
     try:
-        _get_session_or_404(session_id)
+        _get_shift_session_or_404(session_id)
         _get_platform_or_404(payload.platform_id)
 
         existing = (
@@ -637,16 +752,12 @@ def upsert_session_entry(
             .execute()
         ).data
 
-        data = payload.model_dump()
-        data["session_id"] = session_id
-
         if existing:
             row = existing[0]
             if row.get("locked_in") is True and not allow_update_locked:
                 raise HTTPException(status_code=400, detail="Entry is locked_in and cannot be updated")
 
-            upd = {k: v for k, v in data.items() if v is not None}
-            upd.pop("session_id", None)
+            upd = {k: v for k, v in payload.model_dump().items() if v is not None}
             upd.pop("platform_id", None)
 
             if not upd:
@@ -691,7 +802,7 @@ def upsert_session_entry(
 @app.delete("/sessions/{session_id}/entries/{platform_id}")
 def deactivate_session_entry(session_id: str, platform_id: str):
     try:
-        _get_session_or_404(session_id)
+        _get_shift_session_or_404(session_id)
         _get_platform_or_404(platform_id)
 
         res = (
@@ -784,10 +895,12 @@ def deactivate_room(room_id: str):
 
 # ==========================================================
 # ROOM ASSIGNMENTS (room_assignments)
+# (Soporta shift_slot y también "shift" por compatibilidad)
 # ==========================================================
 class RoomAssignmentCreate(BaseModel):
-    assignment_date: Optional[date] = None
-    shift_slot: str
+    assignment_date: Optional[date] = None  # YYYY-MM-DD. Si viene None -> hoy
+
+    shift_slot: str = Field(validation_alias="shift")  # acepta {shift:"morning"} o {shift_slot:"morning"}
     model_id: str
     room_id: str
     active: bool = True
@@ -795,14 +908,14 @@ class RoomAssignmentCreate(BaseModel):
 
 class RoomAssignmentUpdate(BaseModel):
     room_id: Optional[str] = None
-    shift_slot: Optional[str] = None
+    shift_slot: Optional[str] = Field(default=None, validation_alias="shift")
     active: Optional[bool] = None
 
 
 @app.get("/assignments")
 def list_assignments(
     assignment_date: Optional[date] = Query(None, description="YYYY-MM-DD"),
-    shift_slot: Optional[str] = Query(None, description="morning|afternoon|night"),
+    shift_slot: Optional[str] = Query(None, description="morning|afternoon|night", alias="shift"),
     room_id: Optional[str] = None,
     model_id: Optional[str] = None,
     include_inactive: bool = False,
@@ -813,7 +926,7 @@ def list_assignments(
         if assignment_date:
             q = q.eq("assignment_date", str(assignment_date))
         if shift_slot:
-            _validate_shift_slot(shift_slot)
+            _validate_shift(shift_slot)
             q = q.eq("shift_slot", shift_slot)
         if room_id:
             q = q.eq("room_id", room_id)
@@ -835,11 +948,14 @@ def create_assignment(payload: RoomAssignmentCreate):
     try:
         _get_model_or_404(payload.model_id)
         _get_room_or_404(payload.room_id)
-        _validate_shift_slot(payload.shift_slot)
+        _validate_shift(payload.shift_slot)
 
-        data = payload.model_dump()
+        data = payload.model_dump(by_alias=False)
         if data.get("assignment_date") is None:
             data["assignment_date"] = date.today()
+
+        # Aseguramos nombre de columna correcto
+        data["shift_slot"] = payload.shift_slot
 
         res = supabase.table("room_assignments").insert(data).execute()
         if not res.data:
@@ -868,7 +984,7 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
 
         data = {k: v for k, v in payload.model_dump().items() if v is not None}
         if "shift_slot" in data:
-            _validate_shift_slot(str(data["shift_slot"]))
+            _validate_shift(str(data["shift_slot"]))
         if "room_id" in data:
             _get_room_or_404(str(data["room_id"]))
         if not data:

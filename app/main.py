@@ -112,7 +112,6 @@ def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift:
     Si no existe, intenta fallback:
       - si shift=morning: busca afternoon
       - si shift=afternoon: busca morning
-      - si shift=day (no aplica) etc...
     """
     q = (
         supabase.table("room_assignments")
@@ -122,12 +121,10 @@ def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift:
         .eq("active", True)
     )
 
-    # 1) intento exacto
     exact = q.eq("shift_slot", shift).execute().data
     if exact:
         return exact[0]
 
-    # 2) fallback dentro del día
     if shift in ("morning", "afternoon"):
         alt = "afternoon" if shift == "morning" else "morning"
         alt_res = q.eq("shift_slot", alt).execute().data
@@ -511,8 +508,6 @@ def list_sessions(
         if model_id:
             q = q.eq("model_id", model_id)
 
-        # "inactive" en shift_sessions lo interpretamos por status
-        # si include_inactive=False, ocultamos status='deleted'
         if not include_inactive:
             q = q.neq("status", "deleted")
 
@@ -555,7 +550,6 @@ def create_session(payload: SessionCreate):
 
         desired_shift = _default_shift_from_turn_type(payload.turn_type)
 
-        # buscar room_id en asignaciones
         asg = _find_assignment_room_for_model(payload.model_id, payload.session_date, desired_shift)
         if not asg or not asg.get("room_id"):
             raise HTTPException(
@@ -631,7 +625,7 @@ def update_session(session_id: str, payload: SessionUpdate):
     """
     Update en shift_sessions (mapeos):
       - session_date -> date
-      - turn_type -> shift (day->morning, night->night)   (si quieres soportar afternoon explícito, lo hacemos luego)
+      - turn_type -> shift (day->morning, night->night)
       - active=false -> status='deleted'
     """
     try:
@@ -651,7 +645,6 @@ def update_session(session_id: str, payload: SessionUpdate):
             upd["notes"] = data_in["notes"]
 
         if data_in.get("active") is not None:
-            # active false -> deleted
             upd["status"] = "deleted" if data_in["active"] is False else (existing.get("status") or "open")
 
         if not upd:
@@ -898,9 +891,12 @@ def deactivate_room(room_id: str):
 # (Soporta shift_slot y también "shift" por compatibilidad)
 # ==========================================================
 class RoomAssignmentCreate(BaseModel):
-    assignment_date: Optional[date] = None  # YYYY-MM-DD. Si viene None -> hoy
+    # ✅ FIX: el frontend manda "date", la tabla usa "assignment_date"
+    assignment_date: Optional[date] = Field(default=None, validation_alias="date")
 
-    shift_slot: str = Field(validation_alias="shift")  # acepta {shift:"morning"} o {shift_slot:"morning"}
+    # ✅ ya soporta {shift:"morning"} o {shift_slot:"morning"}
+    shift_slot: str = Field(validation_alias="shift")
+
     model_id: str
     room_id: str
     active: bool = True
@@ -951,10 +947,15 @@ def create_assignment(payload: RoomAssignmentCreate):
         _validate_shift(payload.shift_slot)
 
         data = payload.model_dump(by_alias=False)
+
+        # ✅ si no llega, ponemos hoy
         if data.get("assignment_date") is None:
             data["assignment_date"] = date.today()
 
-        # Aseguramos nombre de columna correcto
+        # ✅ guardar como YYYY-MM-DD (consistente con tu columna date en supabase)
+        data["assignment_date"] = str(data["assignment_date"])
+
+        # ✅ asegurar columna correcta
         data["shift_slot"] = payload.shift_slot
 
         res = supabase.table("room_assignments").insert(data).execute()
@@ -983,10 +984,12 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
             raise HTTPException(status_code=404, detail="Assignment not found")
 
         data = {k: v for k, v in payload.model_dump().items() if v is not None}
+
         if "shift_slot" in data:
             _validate_shift(str(data["shift_slot"]))
         if "room_id" in data:
             _get_room_or_404(str(data["room_id"]))
+
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 

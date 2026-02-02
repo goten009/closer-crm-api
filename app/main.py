@@ -17,12 +17,20 @@ app = FastAPI(title="Closer CRM API")
 
 
 # =========================
-# CORS (frontend en localhost:3000)
+# CORS
 # =========================
+# Para nube luego: agrega tu dominio (ej: https://tu-frontend.vercel.app) en EXTRA_ALLOWED_ORIGINS
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
+
+_extra = os.getenv("EXTRA_ALLOWED_ORIGINS", "").strip()
+if _extra:
+    for origin in _extra.split(","):
+        o = origin.strip()
+        if o:
+            ALLOWED_ORIGINS.append(o)
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,11 +43,9 @@ app.add_middleware(
 
 # =========================
 # Validation error handler
-# (para evitar [object Object] y devolver un string claro)
 # =========================
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # construye un mensaje legible para el frontend
     parts = []
     for err in exc.errors():
         loc = ".".join([str(x) for x in err.get("loc", [])])
@@ -62,6 +68,14 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 # =========================
+# TABLE NAMES (AJUSTABLES)
+# =========================
+# Ajusta si tus tablas se llaman distinto en Supabase:
+MODEL_PLATFORMS_TABLE = os.getenv("MODEL_PLATFORMS_TABLE", "model_platforms")
+ENTRIES_TABLE = os.getenv("ENTRIES_TABLE", "shift_session_entries")
+
+
+# =========================
 # Health
 # =========================
 @app.get("/health")
@@ -78,13 +92,6 @@ def _is_unique_violation(e: Exception) -> bool:
 
 
 def _parse_date_any(v) -> Optional[date]:
-    """
-    Acepta:
-      - date
-      - 'YYYY-MM-DD'
-      - 'DD/MM/YYYY'
-    Devuelve date o lanza HTTPException 400 si no puede parsear.
-    """
     if v is None:
         return None
     if isinstance(v, date):
@@ -92,12 +99,10 @@ def _parse_date_any(v) -> Optional[date]:
 
     if isinstance(v, str):
         s = v.strip()
-        # YYYY-MM-DD
         try:
             return datetime.strptime(s, "%Y-%m-%d").date()
         except Exception:
             pass
-        # DD/MM/YYYY
         try:
             return datetime.strptime(s, "%d/%m/%Y").date()
         except Exception:
@@ -172,6 +177,19 @@ def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift:
             return alt_res[0]
 
     return None
+
+
+def _session_to_front(r: Dict[str, Any]) -> Dict[str, Any]:
+    """Normaliza shift_sessions -> formato Session que espera el frontend."""
+    shift = r.get("shift")
+    return {
+        "id": r.get("id"),
+        "model_id": r.get("model_id"),
+        "session_date": r.get("date"),
+        "turn_type": _turn_type_from_shift(shift) if shift else None,
+        "notes": r.get("notes"),
+        "active": (r.get("status") != "deleted"),
+    }
 
 
 # ==========================================================
@@ -272,6 +290,62 @@ def deactivate_model(model_id: str):
 
 
 # ==========================================================
+# MODELS/{id}/platforms  ✅ (lo necesita tu frontend)
+# ==========================================================
+@app.get("/models/{model_id}/platforms")
+def get_model_platforms(model_id: str):
+    """
+    Devuelve plataformas asignadas a un modelo.
+    Esperado por el frontend:
+      - model_id, platform_id, platform_name, calc_type, token_usd_rate
+      - pct_day, pct_night, bonus_threshold_usd, bonus_pct, active
+    """
+    try:
+        _get_model_or_404(model_id)
+
+        # Esto asume que MODEL_PLATFORMS_TABLE tiene columnas:
+        # model_id, platform_id, pct_day, pct_night, bonus_threshold_usd, bonus_pct, active
+        # y que platform_id referencia platforms.id
+        res = (
+            supabase.table(MODEL_PLATFORMS_TABLE)
+            .select(
+                "model_id, platform_id, pct_day, pct_night, bonus_threshold_usd, bonus_pct, active, "
+                "platforms(id, name, calc_type, token_usd_rate, active)"
+            )
+            .eq("model_id", model_id)
+            .execute()
+        )
+
+        rows = res.data or []
+        out: List[Dict[str, Any]] = []
+
+        for r in rows:
+            plat = r.get("platforms") or {}
+            out.append(
+                {
+                    "model_id": r.get("model_id"),
+                    "platform_id": r.get("platform_id"),
+                    "platform_name": plat.get("name"),
+                    "calc_type": plat.get("calc_type"),
+                    "token_usd_rate": plat.get("token_usd_rate"),
+                    "platform_active": plat.get("active"),
+                    "pct_day": r.get("pct_day"),
+                    "pct_night": r.get("pct_night"),
+                    "bonus_threshold_usd": r.get("bonus_threshold_usd"),
+                    "bonus_pct": r.get("bonus_pct"),
+                    "active": r.get("active", True),
+                }
+            )
+
+        return out
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================================
 # PLATFORMS
 # ==========================================================
 class PlatformCreate(BaseModel):
@@ -352,8 +426,7 @@ def deactivate_platform(platform_id: str):
 
 
 # ==========================================================
-# SESSIONS (API contract) -> backed by shift_sessions table
-# (mantengo tu versión original aquí para no reventar otra cosa)
+# SESSIONS -> backed by shift_sessions
 # ==========================================================
 class SessionCreate(BaseModel):
     model_id: str
@@ -388,26 +461,7 @@ def list_sessions(
             q = q.neq("status", "deleted")
 
         rows = q.execute().data or []
-
-        out = []
-        for r in rows:
-            shift = r.get("shift")
-            out.append(
-                {
-                    "id": r.get("id"),
-                    "model_id": r.get("model_id"),
-                    "room_id": r.get("room_id"),
-                    "shift": shift,
-                    "session_date": r.get("date"),
-                    "turn_type": _turn_type_from_shift(shift) if shift else None,
-                    "checkin_at": r.get("checkin_at"),
-                    "checkout_at": r.get("checkout_at"),
-                    "notes": r.get("notes"),
-                    "status": r.get("status"),
-                    "active": (r.get("status") != "deleted"),
-                }
-            )
-        return out
+        return [_session_to_front(r) for r in rows]
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -444,20 +498,7 @@ def create_session(payload: SessionCreate):
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
 
-        r = res.data[0]
-        return {
-            "id": r.get("id"),
-            "model_id": r.get("model_id"),
-            "room_id": r.get("room_id"),
-            "shift": r.get("shift"),
-            "session_date": r.get("date"),
-            "turn_type": _turn_type_from_shift(r.get("shift")),
-            "checkin_at": r.get("checkin_at"),
-            "checkout_at": r.get("checkout_at"),
-            "notes": r.get("notes"),
-            "status": r.get("status"),
-            "active": (r.get("status") != "deleted"),
-        }
+        return _session_to_front(res.data[0])
 
     except HTTPException:
         raise
@@ -468,7 +509,122 @@ def create_session(payload: SessionCreate):
 
 
 # ==========================================================
-# ROOMS (rooms)
+# GET /sessions/{session_id} ✅ (lo necesita tu frontend)
+# ==========================================================
+@app.get("/sessions/{session_id}")
+def get_session(session_id: str):
+    try:
+        s = _get_shift_session_or_404(session_id)
+        return _session_to_front(s)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================================
+# ENTRIES por sesión ✅ (lo necesita tu frontend)
+#   GET  /sessions/{id}/entries
+#   POST /sessions/{id}/entries  (upsert por session_id+platform_id)
+# ==========================================================
+class EntryUpsert(BaseModel):
+    platform_id: str
+    value_in: Optional[float] = None
+    value_out: Optional[float] = None
+    tokens: Optional[float] = None
+    usd_value: Optional[float] = None
+    usd_earned: Optional[float] = None
+    locked_in: Optional[bool] = False
+    active: Optional[bool] = True
+
+
+@app.get("/sessions/{session_id}/entries")
+def list_session_entries(session_id: str):
+    try:
+        _get_shift_session_or_404(session_id)
+
+        res = (
+            supabase.table(ENTRIES_TABLE)
+            .select("*")
+            .eq("session_id", session_id)
+            .order("created_at", desc=False)
+            .execute()
+        )
+        return res.data or []
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sessions/{session_id}/entries")
+def upsert_session_entry(
+    session_id: str,
+    payload: EntryUpsert,
+    allow_update_locked: bool = Query(False),
+):
+    """
+    Upsert lógico:
+      - Si existe (session_id + platform_id) => update
+      - Si no existe => insert
+    Regla de lock:
+      - Si el registro existe y locked_in=True, no deja actualizar
+        a menos que allow_update_locked=true
+    """
+    try:
+        _get_shift_session_or_404(session_id)
+        _get_platform_or_404(payload.platform_id)
+
+        # buscar existente
+        existing = (
+            supabase.table(ENTRIES_TABLE)
+            .select("*")
+            .eq("session_id", session_id)
+            .eq("platform_id", payload.platform_id)
+            .maybe_single()
+            .execute()
+        )
+        cur = getattr(existing, "data", None)
+
+        data = payload.model_dump()
+        data["session_id"] = session_id
+
+        if cur:
+            if cur.get("locked_in") is True and not allow_update_locked:
+                raise HTTPException(status_code=409, detail="Entry is locked (locked_in=true)")
+
+            # update por id (si existe)
+            row_id = cur.get("id")
+            if not row_id:
+                # fallback: update por llaves
+                res = (
+                    supabase.table(ENTRIES_TABLE)
+                    .update(data)
+                    .eq("session_id", session_id)
+                    .eq("platform_id", payload.platform_id)
+                    .execute()
+                )
+            else:
+                res = supabase.table(ENTRIES_TABLE).update(data).eq("id", row_id).execute()
+
+            if not res.data:
+                raise HTTPException(status_code=500, detail="Update failed: empty response")
+            return res.data[0]
+
+        # insert si no existe
+        res = supabase.table(ENTRIES_TABLE).insert(data).execute()
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Insert failed: empty response")
+        return res.data[0]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================================
+# ROOMS
 # ==========================================================
 class RoomCreate(BaseModel):
     name: str
@@ -537,16 +693,14 @@ def deactivate_room(room_id: str):
 
 
 # ==========================================================
-# ROOM ASSIGNMENTS (room_assignments)
+# ROOM ASSIGNMENTS
 # ==========================================================
 class RoomAssignmentCreate(BaseModel):
-    # Acepta date o assignment_date
     assignment_date: Optional[date] = Field(
         default=None,
         validation_alias=AliasChoices("date", "assignment_date"),
     )
 
-    # Acepta shift o shift_slot
     shift_slot: str = Field(
         validation_alias=AliasChoices("shift", "shift_slot"),
     )

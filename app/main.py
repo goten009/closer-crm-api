@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, AliasChoices
 from supabase import create_client
 
 
@@ -57,12 +57,6 @@ def health():
 def _is_unique_violation(e: Exception) -> bool:
     msg = str(e).lower()
     return ("duplicate" in msg) or ("unique" in msg) or ("violates unique constraint" in msg)
-
-
-def _is_column_missing(e: Exception) -> bool:
-    # PostgREST suele responder "column <table>.<col> does not exist"
-    msg = str(e).lower()
-    return ("does not exist" in msg and "column" in msg)
 
 
 def _parse_date_any(v) -> Optional[date]:
@@ -137,89 +131,31 @@ def _turn_type_from_shift(shift: str) -> str:
 
 
 def _default_shift_from_turn_type(turn_type: str) -> str:
-    # si el frontend manda day/no shift, asumimos morning
     return "night" if turn_type == "night" else "morning"
-
-
-# -------------------------
-# room_assignments compat:
-# soporta:
-#   - assignment_date OR date
-#   - shift_slot OR shift
-# -------------------------
-def _ra_query_base(model_id: str, d: date):
-    # Intento A: assignment_date
-    q1 = (
-        supabase.table("room_assignments")
-        .select("*")
-        .eq("model_id", model_id)
-        .eq("assignment_date", str(d))
-        .eq("active", True)
-    )
-    # Intento B: date
-    q2 = (
-        supabase.table("room_assignments")
-        .select("*")
-        .eq("model_id", model_id)
-        .eq("date", str(d))
-        .eq("active", True)
-    )
-    return q1, q2
 
 
 def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift: str) -> Optional[Dict[str, Any]]:
     """
-    Busca asignación activa de room para esa modelo + fecha + shift.
-    Compatibilidad:
-      - room_assignments.assignment_date o room_assignments.date
-      - room_assignments.shift_slot o room_assignments.shift
-    Fallback dentro del día:
-      - morning <-> afternoon
+    Busca la asignación activa de room para esa modelo + fecha + shift_slot.
+    Fallback morning <-> afternoon dentro del día.
     """
-    _validate_shift(shift)
+    q = (
+        supabase.table("room_assignments")
+        .select("*")
+        .eq("model_id", model_id)
+        .eq("assignment_date", str(assignment_date))
+        .eq("active", True)
+    )
 
-    q1, q2 = _ra_query_base(model_id, assignment_date)
+    exact = q.eq("shift_slot", shift).execute().data
+    if exact:
+        return exact[0]
 
-    # 1) intento exacto A: shift_slot
-    try:
-        exact = q1.eq("shift_slot", shift).execute().data
-        if exact:
-            return exact[0]
-    except Exception as e:
-        # si no existe shift_slot/assignment_date, caemos a B
-        if not _is_column_missing(e):
-            raise
-
-    # 2) intento exacto B: shift
-    try:
-        exact2 = q2.eq("shift", shift).execute().data
-        if exact2:
-            return exact2[0]
-    except Exception as e:
-        if not _is_column_missing(e):
-            raise
-
-    # fallback dentro del día
     if shift in ("morning", "afternoon"):
         alt = "afternoon" if shift == "morning" else "morning"
-
-        # A: shift_slot
-        try:
-            alt_res = q1.eq("shift_slot", alt).execute().data
-            if alt_res:
-                return alt_res[0]
-        except Exception as e:
-            if not _is_column_missing(e):
-                raise
-
-        # B: shift
-        try:
-            alt_res2 = q2.eq("shift", alt).execute().data
-            if alt_res2:
-                return alt_res2[0]
-        except Exception as e:
-            if not _is_column_missing(e):
-                raise
+        alt_res = q.eq("shift_slot", alt).execute().data
+        if alt_res:
+            return alt_res[0]
 
     return None
 
@@ -562,7 +498,7 @@ def deactivate_model_platform(model_id: str, platform_id: str):
 
 
 # ==========================================================
-# SESSIONS (API contract)  -> backed by shift_sessions table
+# SESSIONS (API contract) -> shift_sessions
 # ==========================================================
 class SessionCreate(BaseModel):
     model_id: str
@@ -958,22 +894,30 @@ def deactivate_room(room_id: str):
 
 
 # ==========================================================
-# ROOM ASSIGNMENTS (room_assignments) - COMPATIBLE
-# Recibe del frontend:
-#   { date: "01/02/2026", shift: "morning", model_id, room_id }
-# y lo guarda en el esquema que exista:
-#   - assignment_date/shift_slot
-#   - o date/shift
+# ROOM ASSIGNMENTS (room_assignments)
 # ==========================================================
 class RoomAssignmentCreate(BaseModel):
-    # el frontend manda "date" con DD/MM/YYYY o YYYY-MM-DD
-    assignment_date: Optional[date] = Field(default=None, validation_alias="date")
+    # aceptar: date / assignment_date / assignmentDate
+    assignment_date: Optional[date] = Field(
+        default=None,
+        validation_alias=AliasChoices("date", "assignment_date", "assignmentDate"),
+    )
 
-    # el frontend manda shift (morning/afternoon/night)
-    shift_slot: str = Field(validation_alias="shift")
+    # aceptar: shift / shift_slot / shiftSlot
+    shift_slot: str = Field(
+        validation_alias=AliasChoices("shift", "shift_slot", "shiftSlot"),
+    )
 
-    model_id: str
-    room_id: str
+    # aceptar: model_id / modelId
+    model_id: str = Field(
+        validation_alias=AliasChoices("model_id", "modelId"),
+    )
+
+    # aceptar: room_id / roomId
+    room_id: str = Field(
+        validation_alias=AliasChoices("room_id", "roomId"),
+    )
+
     active: bool = True
 
     @field_validator("assignment_date", mode="before")
@@ -983,8 +927,8 @@ class RoomAssignmentCreate(BaseModel):
 
 
 class RoomAssignmentUpdate(BaseModel):
-    room_id: Optional[str] = None
-    shift_slot: Optional[str] = Field(default=None, validation_alias="shift")
+    room_id: Optional[str] = Field(default=None, validation_alias=AliasChoices("room_id", "roomId"))
+    shift_slot: Optional[str] = Field(default=None, validation_alias=AliasChoices("shift", "shift_slot", "shiftSlot"))
     active: Optional[bool] = None
 
 
@@ -997,44 +941,15 @@ def list_assignments(
     include_inactive: bool = False,
 ):
     try:
-        # Intento A (assignment_date/shift_slot)
-        try:
-            q = supabase.table("room_assignments").select("*").order("created_at", desc=False)
-
-            if assignment_date:
-                d = _parse_date_any(assignment_date)
-                q = q.eq("assignment_date", str(d))
-
-            if shift_slot:
-                _validate_shift(shift_slot)
-                q = q.eq("shift_slot", shift_slot)
-
-            if room_id:
-                q = q.eq("room_id", room_id)
-
-            if model_id:
-                q = q.eq("model_id", model_id)
-
-            if not include_inactive:
-                q = q.eq("active", True)
-
-            res = q.execute()
-            return res.data or []
-
-        except Exception as e:
-            if not _is_column_missing(e):
-                raise
-
-        # Intento B (date/shift)
         q = supabase.table("room_assignments").select("*").order("created_at", desc=False)
 
         if assignment_date:
             d = _parse_date_any(assignment_date)
-            q = q.eq("date", str(d))
+            q = q.eq("assignment_date", str(d))
 
         if shift_slot:
             _validate_shift(shift_slot)
-            q = q.eq("shift", shift_slot)
+            q = q.eq("shift_slot", shift_slot)
 
         if room_id:
             q = q.eq("room_id", room_id)
@@ -1047,7 +962,6 @@ def list_assignments(
 
         res = q.execute()
         return res.data or []
-
     except HTTPException:
         raise
     except Exception as e:
@@ -1061,43 +975,21 @@ def create_assignment(payload: RoomAssignmentCreate):
         _get_room_or_404(payload.room_id)
         _validate_shift(payload.shift_slot)
 
+        # arma data final EXACTO como columnas en DB
         d = payload.assignment_date or date.today()
 
-        # Variante A: assignment_date + shift_slot
-        ins_a = {
-            "model_id": payload.model_id,
-            "room_id": payload.room_id,
-            "assignment_date": str(d),
-            "shift_slot": payload.shift_slot,
-            "active": bool(payload.active),
+        data = {
+            "assignment_date": str(d),         # columna: assignment_date (date)
+            "shift_slot": payload.shift_slot,  # columna: shift_slot (text)
+            "model_id": payload.model_id,      # columna: model_id (uuid)
+            "room_id": payload.room_id,        # columna: room_id (uuid)
+            "active": True if payload.active is None else bool(payload.active),
         }
 
-        # Variante B: date + shift
-        ins_b = {
-            "model_id": payload.model_id,
-            "room_id": payload.room_id,
-            "date": str(d),
-            "shift": payload.shift_slot,
-            "active": bool(payload.active),
-        }
-
-        try:
-            res = supabase.table("room_assignments").insert(ins_a).execute()
-            if not res.data:
-                raise HTTPException(status_code=500, detail="Insert failed: empty response")
-            return res.data[0]
-        except Exception as e:
-            # si no existe assignment_date o shift_slot, reintenta con B
-            if _is_column_missing(e):
-                res2 = supabase.table("room_assignments").insert(ins_b).execute()
-                if not res2.data:
-                    raise HTTPException(status_code=500, detail="Insert failed: empty response")
-                return res2.data[0]
-
-            # si es unique, devolvemos 409
-            if _is_unique_violation(e):
-                raise HTTPException(status_code=409, detail="Assignment already exists for that date/shift/model")
-            raise
+        res = supabase.table("room_assignments").insert(data).execute()
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Insert failed: empty response")
+        return res.data[0]
 
     except HTTPException:
         raise
@@ -1110,7 +1002,6 @@ def create_assignment(payload: RoomAssignmentCreate):
 @app.patch("/assignments/{assignment_id}")
 def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
     try:
-        # no asumimos columnas; hacemos update con lo mínimo.
         existing = (
             supabase.table("room_assignments")
             .select("*")
@@ -1123,37 +1014,12 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
 
         data = {k: v for k, v in payload.model_dump().items() if v is not None}
 
-        # normalizar shift: si viene shift_slot, intentamos aplicarlo a shift_slot y si no existe, a shift
-        shift_value = None
+        # Normalizar claves a columnas reales
         if "shift_slot" in data:
-            shift_value = str(data.pop("shift_slot"))
-            _validate_shift(shift_value)
-
+            _validate_shift(str(data["shift_slot"]))
         if "room_id" in data:
             _get_room_or_404(str(data["room_id"]))
 
-        # primero intento A (shift_slot)
-        if shift_value is not None:
-            upd_a = dict(data)
-            upd_a["shift_slot"] = shift_value
-            try:
-                res = supabase.table("room_assignments").update(upd_a).eq("id", assignment_id).execute()
-                if not res.data:
-                    raise HTTPException(status_code=404, detail="Assignment not found")
-                return res.data[0]
-            except Exception as e:
-                if not _is_column_missing(e):
-                    raise
-
-            # intento B (shift)
-            upd_b = dict(data)
-            upd_b["shift"] = shift_value
-            res = supabase.table("room_assignments").update(upd_b).eq("id", assignment_id).execute()
-            if not res.data:
-                raise HTTPException(status_code=404, detail="Assignment not found")
-            return res.data[0]
-
-        # si no venía shift, update normal
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 

@@ -13,22 +13,25 @@ from supabase import create_client
 # =========================
 # App
 # =========================
-app = FastAPI(title="Closer CRM API", version="0.1.0")
+app = FastAPI(title="Closer CRM API")
 
 
 # =========================
 # CORS
+# - Local: localhost:3000
+# - Nube: define FRONTEND_ORIGINS="https://tu-frontend.vercel.app,https://otro-dominio.com"
 # =========================
-ALLOWED_ORIGINS = [
+DEFAULT_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    # cuando subas el frontend, agrega aquí tu dominio Vercel/Render:
-    # "https://tu-frontend.vercel.app",
 ]
+extra = os.getenv("FRONTEND_ORIGINS", "").strip()
+if extra:
+    DEFAULT_ORIGINS += [x.strip() for x in extra.split(",") if x.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=DEFAULT_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,12 +81,6 @@ def _is_unique_violation(e: Exception) -> bool:
 
 
 def _parse_date_any(v) -> Optional[date]:
-    """
-    Acepta:
-      - date
-      - 'YYYY-MM-DD'
-      - 'DD/MM/YYYY'
-    """
     if v is None:
         return None
     if isinstance(v, date):
@@ -113,9 +110,7 @@ def _validate_shift(shift: str) -> None:
         raise HTTPException(status_code=400, detail="shift must be 'morning', 'afternoon', or 'night'")
 
 
-def _turn_type_from_shift(shift: Optional[str]) -> Optional[str]:
-    if not shift:
-        return None
+def _turn_type_from_shift(shift: str) -> str:
     return "night" if shift == "night" else "day"
 
 
@@ -124,20 +119,35 @@ def _default_shift_from_turn_type(turn_type: str) -> str:
 
 
 def _get_model_or_404(model_id: str) -> Dict[str, Any]:
-    res = supabase.table("models").select("id, active").eq("id", model_id).single().execute()
+    if not model_id or model_id == "undefined":
+        raise HTTPException(status_code=400, detail="model_id inválido")
+    res = supabase.table("models").select("*").eq("id", model_id).single().execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Model not found")
     return res.data
 
 
+def _get_platform_or_404(platform_id: str) -> Dict[str, Any]:
+    if not platform_id or platform_id == "undefined":
+        raise HTTPException(status_code=400, detail="platform_id inválido")
+    res = supabase.table("platforms").select("*").eq("id", platform_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Platform not found")
+    return res.data
+
+
 def _get_room_or_404(room_id: str) -> Dict[str, Any]:
-    res = supabase.table("rooms").select("id, active").eq("id", room_id).single().execute()
+    if not room_id or room_id == "undefined":
+        raise HTTPException(status_code=400, detail="room_id inválido")
+    res = supabase.table("rooms").select("*").eq("id", room_id).single().execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Room not found")
     return res.data
 
 
 def _get_shift_session_or_404(session_id: str) -> Dict[str, Any]:
+    if not session_id or session_id == "undefined":
+        raise HTTPException(status_code=400, detail="session_id inválido")
     res = supabase.table("shift_sessions").select("*").eq("id", session_id).single().execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -167,19 +177,20 @@ def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift:
 
 
 def _map_shift_session_row(r: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Devuelve el shape que consume el frontend:
-    Session = {id, model_id, session_date, turn_type, notes, active}
-    """
     shift = r.get("shift")
-    status = r.get("status")
     return {
         "id": r.get("id"),
         "model_id": r.get("model_id"),
         "session_date": r.get("date"),
-        "turn_type": _turn_type_from_shift(shift),
+        "turn_type": _turn_type_from_shift(shift) if shift else None,
         "notes": r.get("notes"),
-        "active": (status != "deleted"),
+        "active": (r.get("status") != "deleted"),
+        # extra opcional (no molesta al frontend si vienen)
+        "room_id": r.get("room_id"),
+        "shift": shift,
+        "status": r.get("status"),
+        "checkin_at": r.get("checkin_at"),
+        "checkout_at": r.get("checkout_at"),
     }
 
 
@@ -188,7 +199,7 @@ def _map_shift_session_row(r: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================================
 class ModelCreate(BaseModel):
     stage_name: str
-    turn_type: str  # "day" or "night"
+    turn_type: str
     legal_name: Optional[str] = None
     document: Optional[str] = None
     phone: Optional[str] = None
@@ -238,10 +249,7 @@ def create_model(payload: ModelCreate):
 @app.get("/models/{model_id}")
 def get_model(model_id: str):
     try:
-        res = supabase.table("models").select("*").eq("id", model_id).single().execute()
-        if not res.data:
-            raise HTTPException(status_code=404, detail="Model not found")
-        return res.data
+        return _get_model_or_404(model_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -251,6 +259,8 @@ def get_model(model_id: str):
 @app.patch("/models/{model_id}")
 def update_model(model_id: str, payload: ModelUpdate):
     try:
+        _get_model_or_404(model_id)
+
         data = {k: v for k, v in payload.model_dump().items() if v is not None}
         if "turn_type" in data:
             _validate_turn_type(str(data["turn_type"]))
@@ -270,6 +280,7 @@ def update_model(model_id: str, payload: ModelUpdate):
 @app.delete("/models/{model_id}")
 def deactivate_model(model_id: str):
     try:
+        _get_model_or_404(model_id)
         res = supabase.table("models").update({"active": False}).eq("id", model_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Model not found")
@@ -281,49 +292,70 @@ def deactivate_model(model_id: str):
 
 
 # ==========================================================
-# MODELS -> PLATFORMS (LO QUE TE FALTA PARA EL FRONTEND)
+# MODELS/{id}/PLATFORMS  (NECESARIO PARA SessionPage)
 # ==========================================================
 @app.get("/models/{model_id}/platforms")
-def get_model_platforms(model_id: str):
+def list_model_platforms(model_id: str):
     """
-    Devuelve un array con fields que consume SessionPage:
-    ModelPlatform = {
-      model_id, platform_id, platform_name, calc_type, token_usd_rate, platform_active,
-      pct_day, pct_night, bonus_threshold_usd, bonus_pct, active
-    }
+    Devuelve plataformas asignadas a un modelo.
+    Esperado por frontend:
+    [
+      {
+        model_id, platform_id, platform_name,
+        calc_type, token_usd_rate,
+        pct_day, pct_night, bonus_threshold_usd, bonus_pct,
+        active
+      }
+    ]
     """
     try:
         _get_model_or_404(model_id)
 
-        # model_platforms + platforms
-        # OJO: este select asume que model_platforms.platform_id FK -> platforms.id
-        res = (
+        # model_platforms: model_id, platform_id, pct_day, pct_night, bonus_threshold_usd, bonus_pct, active
+        mp = (
             supabase.table("model_platforms")
-            .select(
-                "model_id, platform_id, pct_day, pct_night, bonus_threshold_usd, bonus_pct, active, "
-                "platforms:platform_id (id, name, calc_type, token_usd_rate, active)"
-            )
+            .select("*")
             .eq("model_id", model_id)
             .execute()
+            .data
+            or []
         )
 
-        rows = res.data or []
+        if not mp:
+            return []
+
+        # Traemos platforms para nombre + calc
+        platform_ids = list({x.get("platform_id") for x in mp if x.get("platform_id")})
+        if not platform_ids:
+            return []
+
+        pls = (
+            supabase.table("platforms")
+            .select("id, name, calc_type, token_usd_rate, active")
+            .in_("id", platform_ids)
+            .execute()
+            .data
+            or []
+        )
+        pl_by_id = {p["id"]: p for p in pls}
+
         out = []
-        for r in rows:
-            p = r.get("platforms") or {}
+        for row in mp:
+            pid = row.get("platform_id")
+            p = pl_by_id.get(pid, {})
             out.append(
                 {
-                    "model_id": r.get("model_id"),
-                    "platform_id": r.get("platform_id"),
+                    "model_id": row.get("model_id"),
+                    "platform_id": pid,
                     "platform_name": p.get("name"),
                     "calc_type": p.get("calc_type"),
                     "token_usd_rate": p.get("token_usd_rate"),
                     "platform_active": p.get("active"),
-                    "pct_day": r.get("pct_day"),
-                    "pct_night": r.get("pct_night"),
-                    "bonus_threshold_usd": r.get("bonus_threshold_usd"),
-                    "bonus_pct": r.get("bonus_pct"),
-                    "active": r.get("active"),
+                    "pct_day": row.get("pct_day"),
+                    "pct_night": row.get("pct_night"),
+                    "bonus_threshold_usd": row.get("bonus_threshold_usd"),
+                    "bonus_pct": row.get("bonus_pct"),
+                    "active": row.get("active", True),
                 }
             )
 
@@ -339,7 +371,7 @@ def get_model_platforms(model_id: str):
 # ==========================================================
 class PlatformCreate(BaseModel):
     name: str
-    calc_type: str  # "tokens" | "usd_value" | "usd_delta"
+    calc_type: str
     token_usd_rate: Optional[float] = None
     active: bool = True
 
@@ -374,10 +406,7 @@ def create_platform(payload: PlatformCreate):
 @app.get("/platforms/{platform_id}")
 def get_platform(platform_id: str):
     try:
-        res = supabase.table("platforms").select("*").eq("id", platform_id).single().execute()
-        if not res.data:
-            raise HTTPException(status_code=404, detail="Platform not found")
-        return res.data
+        return _get_platform_or_404(platform_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -387,6 +416,8 @@ def get_platform(platform_id: str):
 @app.patch("/platforms/{platform_id}")
 def update_platform(platform_id: str, payload: PlatformUpdate):
     try:
+        _get_platform_or_404(platform_id)
+
         data = {k: v for k, v in payload.model_dump().items() if v is not None}
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -404,6 +435,7 @@ def update_platform(platform_id: str, payload: PlatformUpdate):
 @app.delete("/platforms/{platform_id}")
 def deactivate_platform(platform_id: str):
     try:
+        _get_platform_or_404(platform_id)
         res = supabase.table("platforms").update({"active": False}).eq("id", platform_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Platform not found")
@@ -420,7 +452,7 @@ def deactivate_platform(platform_id: str):
 class SessionCreate(BaseModel):
     model_id: str
     session_date: date
-    turn_type: str  # "day" | "night"
+    turn_type: str
     notes: Optional[str] = None
     active: bool = True
 
@@ -438,7 +470,6 @@ def list_sessions(
             q = q.eq("date", str(session_date))
         if model_id:
             q = q.eq("model_id", model_id)
-
         if not include_inactive:
             q = q.neq("status", "deleted")
 
@@ -448,9 +479,11 @@ def list_sessions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ✅ ESTA ES LA RUTA QUE TE FALTABA (FRONTEND LA LLAMA)
 @app.get("/sessions/{session_id}")
 def get_session(session_id: str):
+    """
+    NECESARIO para SessionPage: devuelve {id, model_id, session_date, turn_type, notes, active}
+    """
     try:
         r = _get_shift_session_or_404(session_id)
         return _map_shift_session_row(r)
@@ -472,10 +505,7 @@ def create_session(payload: SessionCreate):
         if not asg or not asg.get("room_id"):
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"No hay asignación activa (room_assignments) para "
-                    f"model_id={payload.model_id} date={payload.session_date} shift={desired_shift}"
-                ),
+                detail=f"No hay asignación activa (room_assignments) para model_id={payload.model_id} date={payload.session_date} shift={desired_shift}",
             )
 
         room_id = asg["room_id"]
@@ -505,23 +535,16 @@ def create_session(payload: SessionCreate):
 
 
 # ==========================================================
-# SESSION ENTRIES (session_platform_entries)
+# SESSION ENTRIES  (NECESARIO para SessionPage)
+# Tabla asumida: session_platform_entries
 # ==========================================================
-# IMPORTANT:
-# - Este nombre debe existir en tu DB. En tu Supabase se ve como "session_platform_en..."
-#   Si tu tabla se llama distinto, cambia SESSION_ENTRIES_TABLE.
-SESSION_ENTRIES_TABLE = os.getenv("SESSION_ENTRIES_TABLE", "session_platform_entries")
-
-
 class EntryUpsert(BaseModel):
     platform_id: str
-
     value_in: Optional[float] = None
     value_out: Optional[float] = None
     tokens: Optional[float] = None
     usd_value: Optional[float] = None
     usd_earned: Optional[float] = None
-
     locked_in: Optional[bool] = False
     active: Optional[bool] = True
 
@@ -531,13 +554,15 @@ def list_session_entries(session_id: str):
     try:
         _get_shift_session_or_404(session_id)
 
-        res = (
-            supabase.table(SESSION_ENTRIES_TABLE)
+        rows = (
+            supabase.table("session_platform_entries")
             .select("*")
             .eq("session_id", session_id)
+            .order("created_at", desc=False)
             .execute()
+            .data
+            or []
         )
-        rows = res.data or []
         return rows
     except HTTPException:
         raise
@@ -553,14 +578,14 @@ def upsert_session_entry(
 ):
     """
     Upsert por (session_id, platform_id).
-    Si existe y locked_in=true, bloquea salvo allow_update_locked=true.
+    Si existe y está locked_in=true, bloquea salvo allow_update_locked=true
     """
     try:
         _get_shift_session_or_404(session_id)
+        _get_platform_or_404(payload.platform_id)
 
-        # buscar existente
         existing = (
-            supabase.table(SESSION_ENTRIES_TABLE)
+            supabase.table("session_platform_entries")
             .select("*")
             .eq("session_id", session_id)
             .eq("platform_id", payload.platform_id)
@@ -568,27 +593,25 @@ def upsert_session_entry(
             .execute()
         )
 
-        ex = existing.data
+        if existing and existing.data:
+            if existing.data.get("locked_in") and not allow_update_locked:
+                raise HTTPException(status_code=409, detail="Entry is locked_in; set allow_update_locked=true")
 
-        if ex and ex.get("locked_in") and not allow_update_locked:
-            raise HTTPException(status_code=409, detail="Entry is locked (locked_in=true)")
-
-        data = payload.model_dump()
-        data["session_id"] = session_id
-
-        # si existe -> update, si no -> insert
-        if ex:
+            upd = payload.model_dump()
+            upd["session_id"] = session_id
             res = (
-                supabase.table(SESSION_ENTRIES_TABLE)
-                .update(data)
-                .eq("id", ex.get("id"))
+                supabase.table("session_platform_entries")
+                .update(upd)
+                .eq("id", existing.data["id"])
                 .execute()
             )
             if not res.data:
                 raise HTTPException(status_code=500, detail="Update failed: empty response")
             return res.data[0]
 
-        res = supabase.table(SESSION_ENTRIES_TABLE).insert(data).execute()
+        ins = payload.model_dump()
+        ins["session_id"] = session_id
+        res = supabase.table("session_platform_entries").insert(ins).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
@@ -797,12 +820,7 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
 @app.delete("/assignments/{assignment_id}")
 def deactivate_assignment(assignment_id: str):
     try:
-        res = (
-            supabase.table("room_assignments")
-            .update({"active": False})
-            .eq("id", assignment_id)
-            .execute()
-        )
+        res = supabase.table("room_assignments").update({"active": False}).eq("id", assignment_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Assignment not found")
         return {"ok": True, "assignment_id": assignment_id, "active": False}

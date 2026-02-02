@@ -1,10 +1,10 @@
 import os
 from typing import Optional, Dict, Any, List
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from supabase import create_client
 
 
@@ -57,6 +57,35 @@ def health():
 def _is_unique_violation(e: Exception) -> bool:
     msg = str(e).lower()
     return ("duplicate" in msg) or ("unique" in msg) or ("violates unique constraint" in msg)
+
+
+def _parse_date_any(v) -> Optional[date]:
+    """
+    Acepta:
+      - date
+      - 'YYYY-MM-DD'
+      - 'DD/MM/YYYY'
+    Devuelve date o lanza HTTPException 400 si no puede parsear.
+    """
+    if v is None:
+        return None
+    if isinstance(v, date):
+        return v
+
+    if isinstance(v, str):
+        s = v.strip()
+        # YYYY-MM-DD
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception:
+            pass
+        # DD/MM/YYYY
+        try:
+            return datetime.strptime(s, "%d/%m/%Y").date()
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=400, detail=f"Invalid date format: {v}. Use YYYY-MM-DD or DD/MM/YYYY")
 
 
 def _get_model_or_404(model_id: str) -> Dict[str, Any]:
@@ -121,10 +150,12 @@ def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift:
         .eq("active", True)
     )
 
+    # 1) intento exacto
     exact = q.eq("shift_slot", shift).execute().data
     if exact:
         return exact[0]
 
+    # 2) fallback dentro del día
     if shift in ("morning", "afternoon"):
         alt = "afternoon" if shift == "morning" else "morning"
         alt_res = q.eq("shift_slot", alt).execute().data
@@ -495,11 +526,6 @@ def list_sessions(
     model_id: Optional[str] = None,
     include_inactive: bool = False,
 ):
-    """
-    Devuelve sesiones desde shift_sessions pero con campos esperados por frontend:
-    - session_date (mapea a shift_sessions.date)
-    - turn_type (deriva desde shift_sessions.shift)
-    """
     try:
         q = supabase.table("shift_sessions").select("*").order("date", desc=True)
 
@@ -539,11 +565,6 @@ def list_sessions(
 
 @app.post("/sessions")
 def create_session(payload: SessionCreate):
-    """
-    Crea sesión en shift_sessions, auto-resolviendo:
-      - shift: desde turn_type (day->morning por defecto, night->night)
-      - room_id: desde room_assignments (model_id + date + shift_slot)
-    """
     try:
         _get_model_or_404(payload.model_id)
         _validate_turn_type(payload.turn_type)
@@ -622,12 +643,6 @@ def get_session(session_id: str):
 
 @app.patch("/sessions/{session_id}")
 def update_session(session_id: str, payload: SessionUpdate):
-    """
-    Update en shift_sessions (mapeos):
-      - session_date -> date
-      - turn_type -> shift (day->morning, night->night)
-      - active=false -> status='deleted'
-    """
     try:
         existing = _get_shift_session_or_404(session_id)
 
@@ -678,9 +693,6 @@ def update_session(session_id: str, payload: SessionUpdate):
 
 @app.delete("/sessions/{session_id}")
 def deactivate_session(session_id: str):
-    """
-    Soft delete: status='deleted'
-    """
     try:
         _get_shift_session_or_404(session_id)
         res = supabase.table("shift_sessions").update({"status": "deleted"}).eq("id", session_id).execute()
@@ -694,7 +706,7 @@ def deactivate_session(session_id: str):
 
 
 # ==========================================================
-# SESSION ENTRIES (session_platform_entries)  <-- columnas reales
+# SESSION ENTRIES (session_platform_entries)
 # ==========================================================
 class SessionEntryUpsert(BaseModel):
     platform_id: str
@@ -888,18 +900,22 @@ def deactivate_room(room_id: str):
 
 # ==========================================================
 # ROOM ASSIGNMENTS (room_assignments)
-# (Soporta shift_slot y también "shift" por compatibilidad)
 # ==========================================================
 class RoomAssignmentCreate(BaseModel):
-    # ✅ FIX: el frontend manda "date", la tabla usa "assignment_date"
+    # el frontend manda "date" con DD/MM/YYYY o YYYY-MM-DD
     assignment_date: Optional[date] = Field(default=None, validation_alias="date")
 
-    # ✅ ya soporta {shift:"morning"} o {shift_slot:"morning"}
+    # acepta {shift:"morning"} o {shift_slot:"morning"}
     shift_slot: str = Field(validation_alias="shift")
 
     model_id: str
     room_id: str
     active: bool = True
+
+    @field_validator("assignment_date", mode="before")
+    @classmethod
+    def _v_assignment_date(cls, v):
+        return _parse_date_any(v)
 
 
 class RoomAssignmentUpdate(BaseModel):
@@ -910,7 +926,8 @@ class RoomAssignmentUpdate(BaseModel):
 
 @app.get("/assignments")
 def list_assignments(
-    assignment_date: Optional[date] = Query(None, description="YYYY-MM-DD"),
+    # IMPORTANT: el frontend te manda date=01/02/2026 => lo recibimos aquí
+    assignment_date: Optional[str] = Query(None, description="YYYY-MM-DD o DD/MM/YYYY", alias="date"),
     shift_slot: Optional[str] = Query(None, description="morning|afternoon|night", alias="shift"),
     room_id: Optional[str] = None,
     model_id: Optional[str] = None,
@@ -920,14 +937,19 @@ def list_assignments(
         q = supabase.table("room_assignments").select("*").order("created_at", desc=False)
 
         if assignment_date:
-            q = q.eq("assignment_date", str(assignment_date))
+            d = _parse_date_any(assignment_date)
+            q = q.eq("assignment_date", str(d))
+
         if shift_slot:
             _validate_shift(shift_slot)
             q = q.eq("shift_slot", shift_slot)
+
         if room_id:
             q = q.eq("room_id", room_id)
+
         if model_id:
             q = q.eq("model_id", model_id)
+
         if not include_inactive:
             q = q.eq("active", True)
 
@@ -948,14 +970,12 @@ def create_assignment(payload: RoomAssignmentCreate):
 
         data = payload.model_dump(by_alias=False)
 
-        # ✅ si no llega, ponemos hoy
         if data.get("assignment_date") is None:
             data["assignment_date"] = date.today()
 
-        # ✅ guardar como YYYY-MM-DD (consistente con tu columna date en supabase)
+        # guardar siempre en formato YYYY-MM-DD (como columna date en Postgres)
         data["assignment_date"] = str(data["assignment_date"])
 
-        # ✅ asegurar columna correcta
         data["shift_slot"] = payload.shift_slot
 
         res = supabase.table("room_assignments").insert(data).execute()
@@ -984,12 +1004,10 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
             raise HTTPException(status_code=404, detail="Assignment not found")
 
         data = {k: v for k, v in payload.model_dump().items() if v is not None}
-
         if "shift_slot" in data:
             _validate_shift(str(data["shift_slot"]))
         if "room_id" in data:
             _get_room_or_404(str(data["room_id"]))
-
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 

@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field, field_validator, AliasChoices
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from supabase import create_client
 
 
@@ -59,6 +59,19 @@ def _is_unique_violation(e: Exception) -> bool:
     return ("duplicate" in msg) or ("unique" in msg) or ("violates unique constraint" in msg)
 
 
+def _stringify_error(e: Exception) -> str:
+    """
+    Evita que el frontend muestre [object Object]
+    """
+    try:
+        # si viene como dict o algo raro, lo convertimos a string
+        if isinstance(e, HTTPException):
+            return str(e.detail)
+        return str(e)
+    except Exception:
+        return "Unexpected error"
+
+
 def _parse_date_any(v) -> Optional[date]:
     """
     Acepta:
@@ -96,7 +109,7 @@ def _get_model_or_404(model_id: str) -> Dict[str, Any]:
 
 
 def _get_platform_or_404(platform_id: str) -> Dict[str, Any]:
-    res = supabase.table("platforms").select("id, active").eq("id", platform_id).single().execute()
+    res = supabase.table("platforms").select("id, active, calc_type, token_usd_rate, name").eq("id", platform_id).single().execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Platform not found")
     return res.data
@@ -131,13 +144,16 @@ def _turn_type_from_shift(shift: str) -> str:
 
 
 def _default_shift_from_turn_type(turn_type: str) -> str:
+    # si el frontend manda day/no shift, asumimos morning
     return "night" if turn_type == "night" else "morning"
 
 
 def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift: str) -> Optional[Dict[str, Any]]:
     """
     Busca la asignación activa de room para esa modelo + fecha + shift_slot.
-    Fallback morning <-> afternoon dentro del día.
+    Si no existe, intenta fallback:
+      - si shift=morning: busca afternoon
+      - si shift=afternoon: busca morning
     """
     q = (
         supabase.table("room_assignments")
@@ -158,6 +174,88 @@ def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift:
             return alt_res[0]
 
     return None
+
+
+def _ensure_sessions_shadow_row(session_id: str) -> None:
+    """
+    FIX del FK:
+    session_platform_entries.session_id referencia sessions.id.
+    Nosotros creamos sesiones en shift_sessions, así que aseguramos un row espejo en sessions.
+    """
+    # 1) si ya existe en sessions, listo
+    try:
+        existing = supabase.table("sessions").select("id").eq("id", session_id).single().execute()
+        if existing.data and existing.data.get("id"):
+            return
+    except Exception:
+        # si single falla porque no existe, seguimos
+        pass
+
+    # 2) tomamos la sesión real de shift_sessions y la replicamos a sessions
+    ss = _get_shift_session_or_404(session_id)
+    shift = ss.get("shift")
+    turn_type = _turn_type_from_shift(shift) if shift else "day"
+
+    # OJO: asumimos que sessions tiene estas columnas típicas del contrato anterior.
+    payload = {
+        "id": session_id,
+        "model_id": ss.get("model_id"),
+        "session_date": ss.get("date"),
+        "turn_type": turn_type,
+        "notes": ss.get("notes"),
+        "active": (ss.get("status") != "deleted"),
+    }
+
+    # Intentamos insertar. Si tu tabla sessions tiene columnas distintas, esto te lo va a decir claro.
+    try:
+        supabase.table("sessions").insert(payload).execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "FK mismatch: session_platform_entries.session_id points to sessions(id), "
+                "but sessions row could not be created automatically. "
+                f"DB error: {_stringify_error(e)}. "
+                "Option A: adjust sessions table columns to include: id, model_id, session_date, turn_type, notes, active. "
+                "Option B (recommended): change FK to reference shift_sessions(id)."
+            ),
+        )
+
+
+def _auto_fill_usd_value(
+    platform: Dict[str, Any],
+    entry_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Si el frontend no manda usd_value, lo calculamos en backend según calc_type:
+      - tokens: usd_value = tokens * token_usd_rate
+      - usd_delta: usd_value = value_out - value_in (si ambos)
+      - usd_value: se espera usd_value (si no viene, se deja None)
+    """
+    if entry_payload.get("usd_value") is not None:
+        return entry_payload
+
+    calc_type = platform.get("calc_type")
+    rate = platform.get("token_usd_rate")
+
+    if calc_type == "tokens":
+        tokens = entry_payload.get("tokens")
+        if tokens is not None and rate is not None:
+            try:
+                entry_payload["usd_value"] = float(tokens) * float(rate)
+            except Exception:
+                pass
+
+    elif calc_type == "usd_delta":
+        vin = entry_payload.get("value_in")
+        vout = entry_payload.get("value_out")
+        if vin is not None and vout is not None:
+            try:
+                entry_payload["usd_value"] = float(vout) - float(vin)
+            except Exception:
+                pass
+
+    return entry_payload
 
 
 # ==========================================================
@@ -197,7 +295,7 @@ def list_models():
         res = supabase.table("models").select("*").order("created_at", desc=True).execute()
         return res.data or []
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.post("/models")
@@ -208,8 +306,10 @@ def create_model(payload: ModelCreate):
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.get("/models/{model_id}")
@@ -222,7 +322,7 @@ def get_model(model_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.patch("/models/{model_id}")
@@ -241,7 +341,7 @@ def update_model(model_id: str, payload: ModelUpdate):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.delete("/models/{model_id}")
@@ -254,7 +354,7 @@ def deactivate_model(model_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 # ==========================================================
@@ -280,7 +380,7 @@ def list_platforms():
         res = supabase.table("platforms").select("*").order("name", desc=False).execute()
         return res.data or []
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.post("/platforms")
@@ -291,7 +391,7 @@ def create_platform(payload: PlatformCreate):
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.get("/platforms/{platform_id}")
@@ -304,7 +404,7 @@ def get_platform(platform_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.patch("/platforms/{platform_id}")
@@ -321,7 +421,7 @@ def update_platform(platform_id: str, payload: PlatformUpdate):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.delete("/platforms/{platform_id}")
@@ -334,7 +434,7 @@ def deactivate_platform(platform_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 # ==========================================================
@@ -406,7 +506,7 @@ def list_model_platforms(model_id: str, include_inactive: bool = Query(False)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.post("/models/{model_id}/platforms")
@@ -440,7 +540,7 @@ def add_platform_to_model(model_id: str, payload: ModelPlatformCreate):
     except Exception as e:
         if _is_unique_violation(e):
             raise HTTPException(status_code=409, detail="Platform already assigned to this model")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.patch("/models/{model_id}/platforms/{platform_id}")
@@ -469,7 +569,7 @@ def update_model_platform(model_id: str, platform_id: str, payload: ModelPlatfor
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.delete("/models/{model_id}/platforms/{platform_id}")
@@ -494,11 +594,11 @@ def deactivate_model_platform(model_id: str, platform_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 # ==========================================================
-# SESSIONS (API contract) -> shift_sessions
+# SESSIONS (API contract) -> backed by shift_sessions table
 # ==========================================================
 class SessionCreate(BaseModel):
     model_id: str
@@ -555,7 +655,7 @@ def list_sessions(
         return out
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.post("/sessions")
@@ -590,6 +690,10 @@ def create_session(payload: SessionCreate):
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
 
         r = res.data[0]
+
+        # 🔥 FIX FK: crear row espejo en sessions con el mismo id
+        _ensure_sessions_shadow_row(r.get("id"))
+
         return {
             "id": r.get("id"),
             "model_id": r.get("model_id"),
@@ -609,7 +713,7 @@ def create_session(payload: SessionCreate):
     except Exception as e:
         if _is_unique_violation(e):
             raise HTTPException(status_code=409, detail="Session already exists (unique constraint)")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.get("/sessions/{session_id}")
@@ -633,7 +737,7 @@ def get_session(session_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.patch("/sessions/{session_id}")
@@ -665,6 +769,10 @@ def update_session(session_id: str, payload: SessionUpdate):
             raise HTTPException(status_code=404, detail="Session not found")
 
         r = res.data[0]
+
+        # mantener espejo en sessions
+        _ensure_sessions_shadow_row(session_id)
+
         shift = r.get("shift")
         return {
             "id": r.get("id"),
@@ -683,7 +791,7 @@ def update_session(session_id: str, payload: SessionUpdate):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.delete("/sessions/{session_id}")
@@ -693,11 +801,15 @@ def deactivate_session(session_id: str):
         res = supabase.table("shift_sessions").update({"status": "deleted"}).eq("id", session_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Session not found")
+
+        # mantener espejo en sessions
+        _ensure_sessions_shadow_row(session_id)
+
         return {"ok": True, "id": session_id, "active": False}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 # ==========================================================
@@ -721,6 +833,7 @@ class SessionEntryUpsert(BaseModel):
 def list_session_entries(session_id: str, include_inactive: bool = False):
     try:
         _get_shift_session_or_404(session_id)
+        _ensure_sessions_shadow_row(session_id)
 
         q = supabase.table("session_platform_entries").select("*").eq("session_id", session_id)
         if not include_inactive:
@@ -731,7 +844,7 @@ def list_session_entries(session_id: str, include_inactive: bool = False):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.post("/sessions/{session_id}/entries")
@@ -742,7 +855,11 @@ def upsert_session_entry(
 ):
     try:
         _get_shift_session_or_404(session_id)
-        _get_platform_or_404(payload.platform_id)
+
+        # 🔥 FIX FK antes de insertar/updear entries
+        _ensure_sessions_shadow_row(session_id)
+
+        platform = _get_platform_or_404(payload.platform_id)
 
         existing = (
             supabase.table("session_platform_entries")
@@ -759,6 +876,9 @@ def upsert_session_entry(
 
             upd = {k: v for k, v in payload.model_dump().items() if v is not None}
             upd.pop("platform_id", None)
+
+            # autocompletar usd_value si aplica
+            upd = _auto_fill_usd_value(platform, upd)
 
             if not upd:
                 raise HTTPException(status_code=400, detail="No fields to update")
@@ -786,6 +906,9 @@ def upsert_session_entry(
             "active": True if payload.active is None else bool(payload.active),
         }
 
+        # autocompletar usd_value si aplica
+        ins = _auto_fill_usd_value(platform, ins)
+
         res = supabase.table("session_platform_entries").insert(ins).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
@@ -796,13 +919,14 @@ def upsert_session_entry(
     except Exception as e:
         if _is_unique_violation(e):
             raise HTTPException(status_code=409, detail="Entry already exists for this session/platform")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.delete("/sessions/{session_id}/entries/{platform_id}")
 def deactivate_session_entry(session_id: str, platform_id: str):
     try:
         _get_shift_session_or_404(session_id)
+        _ensure_sessions_shadow_row(session_id)
         _get_platform_or_404(platform_id)
 
         res = (
@@ -821,7 +945,7 @@ def deactivate_session_entry(session_id: str, platform_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 # ==========================================================
@@ -846,7 +970,7 @@ def list_rooms(include_inactive: bool = Query(False)):
         res = q.execute()
         return res.data or []
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.post("/rooms")
@@ -857,7 +981,7 @@ def create_room(payload: RoomCreate):
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.patch("/rooms/{room_id}")
@@ -876,7 +1000,7 @@ def update_room(room_id: str, payload: RoomUpdate):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.delete("/rooms/{room_id}")
@@ -890,34 +1014,21 @@ def deactivate_room(room_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 # ==========================================================
 # ROOM ASSIGNMENTS (room_assignments)
 # ==========================================================
 class RoomAssignmentCreate(BaseModel):
-    # aceptar: date / assignment_date / assignmentDate
-    assignment_date: Optional[date] = Field(
-        default=None,
-        validation_alias=AliasChoices("date", "assignment_date", "assignmentDate"),
-    )
+    # el frontend manda "date" con DD/MM/YYYY o YYYY-MM-DD
+    assignment_date: Optional[date] = Field(default=None, validation_alias="date")
 
-    # aceptar: shift / shift_slot / shiftSlot
-    shift_slot: str = Field(
-        validation_alias=AliasChoices("shift", "shift_slot", "shiftSlot"),
-    )
+    # acepta {shift:"morning"} o {shift_slot:"morning"}
+    shift_slot: str = Field(validation_alias="shift")
 
-    # aceptar: model_id / modelId
-    model_id: str = Field(
-        validation_alias=AliasChoices("model_id", "modelId"),
-    )
-
-    # aceptar: room_id / roomId
-    room_id: str = Field(
-        validation_alias=AliasChoices("room_id", "roomId"),
-    )
-
+    model_id: str
+    room_id: str
     active: bool = True
 
     @field_validator("assignment_date", mode="before")
@@ -927,8 +1038,8 @@ class RoomAssignmentCreate(BaseModel):
 
 
 class RoomAssignmentUpdate(BaseModel):
-    room_id: Optional[str] = Field(default=None, validation_alias=AliasChoices("room_id", "roomId"))
-    shift_slot: Optional[str] = Field(default=None, validation_alias=AliasChoices("shift", "shift_slot", "shiftSlot"))
+    room_id: Optional[str] = None
+    shift_slot: Optional[str] = Field(default=None, validation_alias="shift")
     active: Optional[bool] = None
 
 
@@ -965,7 +1076,7 @@ def list_assignments(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.post("/assignments")
@@ -975,28 +1086,24 @@ def create_assignment(payload: RoomAssignmentCreate):
         _get_room_or_404(payload.room_id)
         _validate_shift(payload.shift_slot)
 
-        # arma data final EXACTO como columnas en DB
-        d = payload.assignment_date or date.today()
+        data = payload.model_dump(by_alias=False)
 
-        data = {
-            "assignment_date": str(d),         # columna: assignment_date (date)
-            "shift_slot": payload.shift_slot,  # columna: shift_slot (text)
-            "model_id": payload.model_id,      # columna: model_id (uuid)
-            "room_id": payload.room_id,        # columna: room_id (uuid)
-            "active": True if payload.active is None else bool(payload.active),
-        }
+        if data.get("assignment_date") is None:
+            data["assignment_date"] = date.today()
+
+        data["assignment_date"] = str(data["assignment_date"])
+        data["shift_slot"] = payload.shift_slot
 
         res = supabase.table("room_assignments").insert(data).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
-
     except HTTPException:
         raise
     except Exception as e:
         if _is_unique_violation(e):
             raise HTTPException(status_code=409, detail="Assignment already exists for that date/shift/model")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.patch("/assignments/{assignment_id}")
@@ -1013,13 +1120,10 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
             raise HTTPException(status_code=404, detail="Assignment not found")
 
         data = {k: v for k, v in payload.model_dump().items() if v is not None}
-
-        # Normalizar claves a columnas reales
         if "shift_slot" in data:
             _validate_shift(str(data["shift_slot"]))
         if "room_id" in data:
             _get_room_or_404(str(data["room_id"]))
-
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -1027,13 +1131,12 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
         if not res.data:
             raise HTTPException(status_code=404, detail="Assignment not found")
         return res.data[0]
-
     except HTTPException:
         raise
     except Exception as e:
         if _is_unique_violation(e):
             raise HTTPException(status_code=409, detail="Assignment already exists for that date/shift/model")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))
 
 
 @app.delete("/assignments/{assignment_id}")
@@ -1046,4 +1149,4 @@ def deactivate_assignment(assignment_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=_stringify_error(e))

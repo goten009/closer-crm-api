@@ -29,6 +29,7 @@ def _load_origins() -> List[str]:
         return ["http://localhost:3000", "http://127.0.0.1:3000"]
     return [x.strip() for x in raw.split(",") if x.strip()]
 
+
 ALLOWED_ORIGINS = _load_origins()
 
 app.add_middleware(
@@ -399,12 +400,10 @@ def get_model_platforms(model_id: str):
                 "calc_type": p.get("calc_type"),
                 "token_usd_rate": p.get("token_usd_rate"),
                 "platform_active": p.get("active", True),
-
                 "pct_day": row.get("pct_day"),
                 "pct_night": row.get("pct_night"),
                 "bonus_threshold_usd": row.get("bonus_threshold_usd"),
                 "bonus_pct": row.get("bonus_pct"),
-
                 "active": row.get("active", True),
             }
         )
@@ -524,6 +523,7 @@ def list_session_entries(session_id: str):
     return rows
 
 
+# ✅ FIX: evita NoneType.data + devuelve error real de Supabase
 @app.post("/sessions/{session_id}/entries")
 def upsert_session_entry(
     session_id: str,
@@ -536,35 +536,55 @@ def upsert_session_entry(
     platform_id = _require_uuid(payload.platform_id, "platform_id")
     _get_platform_or_404(platform_id)
 
-    # Si existe y está locked, no permitimos update salvo allow_update_locked=true
-    existing = (
-        supabase.table("session_platform_entries")
-        .select("id, locked_in")
-        .eq("session_id", session_id)
-        .eq("platform_id", platform_id)
-        .maybe_single()
-        .execute()
-        .data
-    )
-
-    if existing and existing.get("locked_in") and not allow_update_locked:
-        raise HTTPException(status_code=409, detail="Entry is locked. Use allow_update_locked=true to update.")
-
-    data = payload.model_dump()
-    data["session_id"] = session_id
-    data["platform_id"] = platform_id
-
-    # Upsert por (session_id, platform_id)
-    # IMPORTANTE: en tu BD debe existir unique(session_id, platform_id)
     try:
+        # 1) Lookup existing (seguro)
+        existing_res = (
+            supabase.table("session_platform_entries")
+            .select("id, locked_in")
+            .eq("session_id", session_id)
+            .eq("platform_id", platform_id)
+            .maybe_single()
+            .execute()
+        )
+
+        if existing_res is None:
+            raise HTTPException(status_code=502, detail="Supabase returned None on existing lookup")
+
+        existing = getattr(existing_res, "data", None)
+
+        if existing and existing.get("locked_in") and not allow_update_locked:
+            raise HTTPException(
+                status_code=409,
+                detail="Entry is locked. Use allow_update_locked=true to update.",
+            )
+
+        # 2) Data + upsert
+        data = payload.model_dump()
+        data["session_id"] = session_id
+        data["platform_id"] = platform_id
+
         res = (
             supabase.table("session_platform_entries")
             .upsert(data, on_conflict="session_id,platform_id")
+            .select("*")
             .execute()
         )
-        if not res.data:
+
+        if res is None:
+            raise HTTPException(status_code=502, detail="Supabase returned None on upsert")
+
+        err = getattr(res, "error", None)
+        if err:
+            msg = getattr(err, "message", None) or str(err)
+            raise HTTPException(status_code=400, detail=f"Supabase error: {msg}")
+
+        if not getattr(res, "data", None):
             return {"ok": True}
+
         return res.data[0]
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -354,9 +354,8 @@ def deactivate_platform(platform_id: str):
 
 
 # ==========================================================
-# MODEL PLATFORMS  ✅ (esto lo usa tu frontend)
+# MODEL PLATFORMS
 # GET /models/{model_id}/platforms
-# - sale de model_platforms + join con platforms
 # ==========================================================
 @app.get("/models/{model_id}/platforms")
 def get_model_platforms(model_id: str):
@@ -412,8 +411,6 @@ def get_model_platforms(model_id: str):
 
 # ==========================================================
 # SESSIONS
-# - storage real: shift_sessions
-# - contract frontend: /sessions/{id} y /sessions/{id}/entries
 # ==========================================================
 class SessionCreate(BaseModel):
     model_id: str
@@ -483,7 +480,6 @@ def create_session(payload: SessionCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ✅ ESTE ES EL QUE TE FALTA EN LA NUBE
 @app.get("/sessions/{session_id}")
 def get_session(session_id: str):
     r = _get_shift_session_or_404(session_id)
@@ -491,7 +487,7 @@ def get_session(session_id: str):
 
 
 # ==========================================================
-# SESSION PLATFORM ENTRIES ✅ (lo usa tu SessionPage)
+# SESSION PLATFORM ENTRIES
 # tabla: session_platform_entries
 # ==========================================================
 class SessionEntryUpsert(BaseModel):
@@ -523,7 +519,7 @@ def list_session_entries(session_id: str):
     return rows
 
 
-# ✅ FIX: evita NoneType.data + devuelve error real de Supabase
+# ✅ FIX DEFINITIVO: sin maybe_single (evita None) + errores claros
 @app.post("/sessions/{session_id}/entries")
 def upsert_session_entry(
     session_id: str,
@@ -537,20 +533,26 @@ def upsert_session_entry(
     _get_platform_or_404(platform_id)
 
     try:
-        # 1) Lookup existing (seguro)
+        # 1) Lookup existing (SIN maybe_single)
         existing_res = (
             supabase.table("session_platform_entries")
             .select("id, locked_in")
             .eq("session_id", session_id)
             .eq("platform_id", platform_id)
-            .maybe_single()
+            .limit(1)
             .execute()
         )
 
         if existing_res is None:
             raise HTTPException(status_code=502, detail="Supabase returned None on existing lookup")
 
-        existing = getattr(existing_res, "data", None)
+        err_lookup = getattr(existing_res, "error", None)
+        if err_lookup:
+            msg = getattr(err_lookup, "message", None) or str(err_lookup)
+            raise HTTPException(status_code=400, detail=f"Supabase error (lookup): {msg}")
+
+        existing_list = getattr(existing_res, "data", None) or []
+        existing = existing_list[0] if existing_list else None
 
         if existing and existing.get("locked_in") and not allow_update_locked:
             raise HTTPException(
@@ -576,7 +578,7 @@ def upsert_session_entry(
         err = getattr(res, "error", None)
         if err:
             msg = getattr(err, "message", None) or str(err)
-            raise HTTPException(status_code=400, detail=f"Supabase error: {msg}")
+            raise HTTPException(status_code=400, detail=f"Supabase error (upsert): {msg}")
 
         if not getattr(res, "data", None):
             return {"ok": True}

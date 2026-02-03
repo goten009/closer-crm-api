@@ -355,7 +355,6 @@ def deactivate_platform(platform_id: str):
 
 # ==========================================================
 # MODEL PLATFORMS
-# GET /models/{model_id}/platforms
 # ==========================================================
 @app.get("/models/{model_id}/platforms")
 def get_model_platforms(model_id: str):
@@ -488,7 +487,6 @@ def get_session(session_id: str):
 
 # ==========================================================
 # SESSION PLATFORM ENTRIES
-# tabla: session_platform_entries
 # ==========================================================
 class SessionEntryUpsert(BaseModel):
     platform_id: str
@@ -519,7 +517,7 @@ def list_session_entries(session_id: str):
     return rows
 
 
-# ✅ FIX DEFINITIVO: sin maybe_single (evita None) + errores claros
+# ✅ FIX REAL: NO usa maybe_single() para evitar None en Render
 @app.post("/sessions/{session_id}/entries")
 def upsert_session_entry(
     session_id: str,
@@ -533,7 +531,7 @@ def upsert_session_entry(
     _get_platform_or_404(platform_id)
 
     try:
-        # 1) Lookup existing (SIN maybe_single)
+        # 1) Lookup existing (siempre lista, sin maybe_single)
         existing_res = (
             supabase.table("session_platform_entries")
             .select("id, locked_in")
@@ -575,10 +573,10 @@ def upsert_session_entry(
         if res is None:
             raise HTTPException(status_code=502, detail="Supabase returned None on upsert")
 
-        err = getattr(res, "error", None)
-        if err:
-            msg = getattr(err, "message", None) or str(err)
-            raise HTTPException(status_code=400, detail=f"Supabase error (upsert): {msg}")
+        err_upsert = getattr(res, "error", None)
+        if err_upsert:
+            msg2 = getattr(err_upsert, "message", None) or str(err_upsert)
+            raise HTTPException(status_code=400, detail=f"Supabase error (upsert): {msg2}")
 
         if not getattr(res, "data", None):
             return {"ok": True}

@@ -19,9 +19,6 @@ app = FastAPI(title="Closer CRM API", version="0.1.0")
 
 # =========================
 # CORS
-# - Para local + cloud, usa env CORS_ORIGINS (comma separated)
-#   Ej:
-#   CORS_ORIGINS=http://localhost:3000,https://tu-frontend.vercel.app
 # =========================
 def _load_origins() -> List[str]:
     raw = os.getenv("CORS_ORIGINS", "").strip()
@@ -122,7 +119,7 @@ def _require_uuid(value: str, label: str) -> str:
 def _get_model_or_404(model_id: str) -> Dict[str, Any]:
     model_id = _require_uuid(model_id, "model_id")
     res = supabase.table("models").select("id, active").eq("id", model_id).single().execute()
-    if not res.data:
+    if not getattr(res, "data", None):
         raise HTTPException(status_code=404, detail="Model not found")
     return res.data
 
@@ -130,7 +127,7 @@ def _get_model_or_404(model_id: str) -> Dict[str, Any]:
 def _get_platform_or_404(platform_id: str) -> Dict[str, Any]:
     platform_id = _require_uuid(platform_id, "platform_id")
     res = supabase.table("platforms").select("id, active").eq("id", platform_id).single().execute()
-    if not res.data:
+    if not getattr(res, "data", None):
         raise HTTPException(status_code=404, detail="Platform not found")
     return res.data
 
@@ -138,7 +135,7 @@ def _get_platform_or_404(platform_id: str) -> Dict[str, Any]:
 def _get_room_or_404(room_id: str) -> Dict[str, Any]:
     room_id = _require_uuid(room_id, "room_id")
     res = supabase.table("rooms").select("id, active").eq("id", room_id).single().execute()
-    if not res.data:
+    if not getattr(res, "data", None):
         raise HTTPException(status_code=404, detail="Room not found")
     return res.data
 
@@ -146,7 +143,7 @@ def _get_room_or_404(room_id: str) -> Dict[str, Any]:
 def _get_shift_session_or_404(session_id: str) -> Dict[str, Any]:
     session_id = _require_uuid(session_id, "session_id")
     res = supabase.table("shift_sessions").select("*").eq("id", session_id).single().execute()
-    if not res.data:
+    if not getattr(res, "data", None):
         raise HTTPException(status_code=404, detail="Session not found")
     return res.data
 
@@ -203,7 +200,6 @@ def _map_shift_session_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "turn_type": _turn_type_from_shift(shift),
         "notes": r.get("notes"),
         "active": (r.get("status") != "deleted"),
-        # extras útiles (no rompen al frontend si sobran)
         "room_id": r.get("room_id"),
         "shift": shift,
         "status": r.get("status"),
@@ -517,71 +513,98 @@ def list_session_entries(session_id: str):
     return rows
 
 
-# ✅ FIX REAL: NO usa maybe_single() para evitar None en Render
 @app.post("/sessions/{session_id}/entries")
 def upsert_session_entry(
     session_id: str,
     payload: SessionEntryUpsert,
     allow_update_locked: bool = Query(False),
 ):
+    """
+    FIX real:
+    - No encadenar .select() después de .upsert() (tu supabase-py no lo soporta).
+    - Manejar cuando supabase devuelve None.
+    - Si returning="representation" no existe, hacemos fallback y luego consultamos.
+    """
     session_id = _require_uuid(session_id, "session_id")
     _get_shift_session_or_404(session_id)
 
     platform_id = _require_uuid(payload.platform_id, "platform_id")
     _get_platform_or_404(platform_id)
 
+    # 1) Lookup existing
+    existing_res = (
+        supabase.table("session_platform_entries")
+        .select("id, locked_in")
+        .eq("session_id", session_id)
+        .eq("platform_id", platform_id)
+        .maybe_single()
+        .execute()
+    )
+
+    if existing_res is None:
+        raise HTTPException(status_code=502, detail="Supabase returned None on existing lookup")
+
+    existing = getattr(existing_res, "data", None)
+
+    # OJO: algunas versiones pueden devolver lista
+    if isinstance(existing, list):
+        existing = existing[0] if existing else None
+
+    if existing and existing.get("locked_in") and not allow_update_locked:
+        raise HTTPException(status_code=409, detail="Entry is locked. Use allow_update_locked=true to update.")
+
+    # 2) Upsert
+    data = payload.model_dump()
+    data["session_id"] = session_id
+    data["platform_id"] = platform_id
+
     try:
-        # 1) Lookup existing (siempre lista, sin maybe_single)
-        existing_res = (
-            supabase.table("session_platform_entries")
-            .select("id, locked_in")
-            .eq("session_id", session_id)
-            .eq("platform_id", platform_id)
-            .limit(1)
-            .execute()
-        )
-
-        if existing_res is None:
-            raise HTTPException(status_code=502, detail="Supabase returned None on existing lookup")
-
-        err_lookup = getattr(existing_res, "error", None)
-        if err_lookup:
-            msg = getattr(err_lookup, "message", None) or str(err_lookup)
-            raise HTTPException(status_code=400, detail=f"Supabase error (lookup): {msg}")
-
-        existing_list = getattr(existing_res, "data", None) or []
-        existing = existing_list[0] if existing_list else None
-
-        if existing and existing.get("locked_in") and not allow_update_locked:
-            raise HTTPException(
-                status_code=409,
-                detail="Entry is locked. Use allow_update_locked=true to update.",
+        # Intento A: pedir representación (si tu lib lo soporta)
+        try:
+            res = (
+                supabase.table("session_platform_entries")
+                .upsert(data, on_conflict="session_id,platform_id", returning="representation")
+                .execute()
             )
-
-        # 2) Data + upsert
-        data = payload.model_dump()
-        data["session_id"] = session_id
-        data["platform_id"] = platform_id
-
-        res = (
-            supabase.table("session_platform_entries")
-            .upsert(data, on_conflict="session_id,platform_id")
-            .select("*")
-            .execute()
-        )
+        except TypeError:
+            # Intento B: sin returning (fallback)
+            res = (
+                supabase.table("session_platform_entries")
+                .upsert(data, on_conflict="session_id,platform_id")
+                .execute()
+            )
 
         if res is None:
             raise HTTPException(status_code=502, detail="Supabase returned None on upsert")
 
-        err_upsert = getattr(res, "error", None)
-        if err_upsert:
-            msg2 = getattr(err_upsert, "message", None) or str(err_upsert)
-            raise HTTPException(status_code=400, detail=f"Supabase error (upsert): {msg2}")
+        err = getattr(res, "error", None)
+        if err:
+            msg = getattr(err, "message", None) or str(err)
+            raise HTTPException(status_code=400, detail=f"Supabase error: {msg}")
 
-        if not getattr(res, "data", None):
-            return {"ok": True}
+        out = getattr(res, "data", None)
 
-        return res.data[0]
+        # Si no devolvió data, consultamos la fila recién guardada
+        if not out:
+            fetch = (
+                supabase.table("session_platform_entries")
+                .select("*")
+                .eq("session_id", session_id)
+                .eq("platform_id", platform_id)
+                .maybe_single()
+                .execute()
+            )
+            if fetch is None:
+                return {"ok": True}
+            fdata = getattr(fetch, "data", None)
+            if isinstance(fdata, list):
+                fdata = fdata[0] if fdata else None
+            return fdata or {"ok": True}
+
+        # out puede venir como lista
+        if isinstance(out, list):
+            return out[0] if out else {"ok": True}
+        return out
 
     except HTTPException:
         raise

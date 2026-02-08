@@ -116,34 +116,68 @@ def _require_uuid(value: str, label: str) -> str:
         raise HTTPException(status_code=400, detail=f"{label} must be a valid uuid")
 
 
+def _sb_execute(builder, label: str):
+    """
+    Ejecuta una query de supabase-py de forma segura.
+    - Si Supabase devuelve None, lo convertimos en 502 con contexto
+    - Si hay error, lo devolvemos con detalle
+    """
+    try:
+        res = builder.execute()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase call failed ({label}): {str(e)}")
+
+    if res is None:
+        raise HTTPException(status_code=502, detail=f"Supabase returned None ({label})")
+
+    err = getattr(res, "error", None)
+    if err:
+        msg = getattr(err, "message", None) or str(err)
+        raise HTTPException(status_code=400, detail=f"Supabase error ({label}): {msg}")
+
+    return res
+
+
 def _get_model_or_404(model_id: str) -> Dict[str, Any]:
     model_id = _require_uuid(model_id, "model_id")
-    res = supabase.table("models").select("id, active").eq("id", model_id).single().execute()
-    if not getattr(res, "data", None):
+    res = _sb_execute(
+        supabase.table("models").select("id, active").eq("id", model_id).single(),
+        "get model",
+    )
+    if not res.data:
         raise HTTPException(status_code=404, detail="Model not found")
     return res.data
 
 
 def _get_platform_or_404(platform_id: str) -> Dict[str, Any]:
     platform_id = _require_uuid(platform_id, "platform_id")
-    res = supabase.table("platforms").select("id, active").eq("id", platform_id).single().execute()
-    if not getattr(res, "data", None):
+    res = _sb_execute(
+        supabase.table("platforms").select("id, active").eq("id", platform_id).single(),
+        "get platform",
+    )
+    if not res.data:
         raise HTTPException(status_code=404, detail="Platform not found")
     return res.data
 
 
 def _get_room_or_404(room_id: str) -> Dict[str, Any]:
     room_id = _require_uuid(room_id, "room_id")
-    res = supabase.table("rooms").select("id, active").eq("id", room_id).single().execute()
-    if not getattr(res, "data", None):
+    res = _sb_execute(
+        supabase.table("rooms").select("id, active").eq("id", room_id).single(),
+        "get room",
+    )
+    if not res.data:
         raise HTTPException(status_code=404, detail="Room not found")
     return res.data
 
 
 def _get_shift_session_or_404(session_id: str) -> Dict[str, Any]:
     session_id = _require_uuid(session_id, "session_id")
-    res = supabase.table("shift_sessions").select("*").eq("id", session_id).single().execute()
-    if not getattr(res, "data", None):
+    res = _sb_execute(
+        supabase.table("shift_sessions").select("*").eq("id", session_id).single(),
+        "get shift_session",
+    )
+    if not res.data:
         raise HTTPException(status_code=404, detail="Session not found")
     return res.data
 
@@ -178,13 +212,13 @@ def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift:
         .eq("active", True)
     )
 
-    exact = q.eq("shift_slot", shift).execute().data
+    exact = _sb_execute(q.eq("shift_slot", shift), "find assignment exact").data
     if exact:
         return exact[0]
 
     if shift in ("morning", "afternoon"):
         alt = "afternoon" if shift == "morning" else "morning"
-        alt_res = q.eq("shift_slot", alt).execute().data
+        alt_res = _sb_execute(q.eq("shift_slot", alt), "find assignment alt").data
         if alt_res:
             return alt_res[0]
 
@@ -241,14 +275,14 @@ class ModelUpdate(BaseModel):
 
 @app.get("/models")
 def list_models():
-    res = supabase.table("models").select("*").order("created_at", desc=True).execute()
+    res = _sb_execute(supabase.table("models").select("*").order("created_at", desc=True), "list models")
     return res.data or []
 
 
 @app.post("/models")
 def create_model(payload: ModelCreate):
     _validate_turn_type(payload.turn_type)
-    res = supabase.table("models").insert(payload.model_dump()).execute()
+    res = _sb_execute(supabase.table("models").insert(payload.model_dump()), "create model")
     if not res.data:
         raise HTTPException(status_code=500, detail="Insert failed: empty response")
     return res.data[0]
@@ -257,7 +291,7 @@ def create_model(payload: ModelCreate):
 @app.get("/models/{model_id}")
 def get_model(model_id: str):
     model_id = _require_uuid(model_id, "model_id")
-    res = supabase.table("models").select("*").eq("id", model_id).single().execute()
+    res = _sb_execute(supabase.table("models").select("*").eq("id", model_id).single(), "get model by id")
     if not res.data:
         raise HTTPException(status_code=404, detail="Model not found")
     return res.data
@@ -272,7 +306,7 @@ def update_model(model_id: str, payload: ModelUpdate):
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    res = supabase.table("models").update(data).eq("id", model_id).execute()
+    res = _sb_execute(supabase.table("models").update(data).eq("id", model_id), "update model")
     if not res.data:
         raise HTTPException(status_code=404, detail="Model not found")
     return res.data[0]
@@ -281,7 +315,7 @@ def update_model(model_id: str, payload: ModelUpdate):
 @app.delete("/models/{model_id}")
 def deactivate_model(model_id: str):
     model_id = _require_uuid(model_id, "model_id")
-    res = supabase.table("models").update({"active": False}).eq("id", model_id).execute()
+    res = _sb_execute(supabase.table("models").update({"active": False}).eq("id", model_id), "deactivate model")
     if not res.data:
         raise HTTPException(status_code=404, detail="Model not found")
     return {"ok": True, "id": model_id, "active": False}
@@ -306,13 +340,13 @@ class PlatformUpdate(BaseModel):
 
 @app.get("/platforms")
 def list_platforms():
-    res = supabase.table("platforms").select("*").order("name", desc=False).execute()
+    res = _sb_execute(supabase.table("platforms").select("*").order("name", desc=False), "list platforms")
     return res.data or []
 
 
 @app.post("/platforms")
 def create_platform(payload: PlatformCreate):
-    res = supabase.table("platforms").insert(payload.model_dump()).execute()
+    res = _sb_execute(supabase.table("platforms").insert(payload.model_dump()), "create platform")
     if not res.data:
         raise HTTPException(status_code=500, detail="Insert failed: empty response")
     return res.data[0]
@@ -321,7 +355,7 @@ def create_platform(payload: PlatformCreate):
 @app.get("/platforms/{platform_id}")
 def get_platform(platform_id: str):
     platform_id = _require_uuid(platform_id, "platform_id")
-    res = supabase.table("platforms").select("*").eq("id", platform_id).single().execute()
+    res = _sb_execute(supabase.table("platforms").select("*").eq("id", platform_id).single(), "get platform by id")
     if not res.data:
         raise HTTPException(status_code=404, detail="Platform not found")
     return res.data
@@ -334,7 +368,7 @@ def update_platform(platform_id: str, payload: PlatformUpdate):
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    res = supabase.table("platforms").update(data).eq("id", platform_id).execute()
+    res = _sb_execute(supabase.table("platforms").update(data).eq("id", platform_id), "update platform")
     if not res.data:
         raise HTTPException(status_code=404, detail="Platform not found")
     return res.data[0]
@@ -343,7 +377,7 @@ def update_platform(platform_id: str, payload: PlatformUpdate):
 @app.delete("/platforms/{platform_id}")
 def deactivate_platform(platform_id: str):
     platform_id = _require_uuid(platform_id, "platform_id")
-    res = supabase.table("platforms").update({"active": False}).eq("id", platform_id).execute()
+    res = _sb_execute(supabase.table("platforms").update({"active": False}).eq("id", platform_id), "deactivate platform")
     if not res.data:
         raise HTTPException(status_code=404, detail="Platform not found")
     return {"ok": True, "id": platform_id, "active": False}
@@ -356,14 +390,13 @@ def deactivate_platform(platform_id: str):
 def get_model_platforms(model_id: str):
     model_id = _require_uuid(model_id, "model_id")
 
-    mp = (
+    mp_res = _sb_execute(
         supabase.table("model_platforms")
         .select("model_id, platform_id, pct_day, pct_night, bonus_threshold_usd, bonus_pct, active")
-        .eq("model_id", model_id)
-        .execute()
-        .data
-        or []
+        .eq("model_id", model_id),
+        "model_platforms for model",
     )
+    mp = mp_res.data or []
 
     if not mp:
         return []
@@ -372,14 +405,13 @@ def get_model_platforms(model_id: str):
     if not platform_ids:
         return []
 
-    pl = (
+    pl_res = _sb_execute(
         supabase.table("platforms")
         .select("id, name, calc_type, token_usd_rate, active")
-        .in_("id", platform_ids)
-        .execute()
-        .data
-        or []
+        .in_("id", platform_ids),
+        "platforms for model_platforms",
     )
+    pl = pl_res.data or []
     pl_map = {p["id"]: p for p in pl}
 
     out = []
@@ -431,7 +463,7 @@ def list_sessions(
     if not include_inactive:
         q = q.neq("status", "deleted")
 
-    rows = q.execute().data or []
+    rows = _sb_execute(q, "list sessions").data or []
     return [_map_shift_session_row(r) for r in rows]
 
 
@@ -465,7 +497,7 @@ def create_session(payload: SessionCreate):
     }
 
     try:
-        res = supabase.table("shift_sessions").insert(ins).execute()
+        res = _sb_execute(supabase.table("shift_sessions").insert(ins), "create session")
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return _map_shift_session_row(res.data[0])
@@ -482,7 +514,8 @@ def get_session(session_id: str):
 
 
 # ==========================================================
-# SESSION PLATFORM ENTRIES
+# SESSION PLATFORM ENTRIES  ✅ FIXED
+# tabla: session_platform_entries
 # ==========================================================
 class SessionEntryUpsert(BaseModel):
     platform_id: str
@@ -502,14 +535,10 @@ def list_session_entries(session_id: str):
     session_id = _require_uuid(session_id, "session_id")
     _get_shift_session_or_404(session_id)
 
-    rows = (
-        supabase.table("session_platform_entries")
-        .select("*")
-        .eq("session_id", session_id)
-        .execute()
-        .data
-        or []
-    )
+    rows = _sb_execute(
+        supabase.table("session_platform_entries").select("*").eq("session_id", session_id),
+        "list session entries",
+    ).data or []
     return rows
 
 
@@ -519,97 +548,41 @@ def upsert_session_entry(
     payload: SessionEntryUpsert,
     allow_update_locked: bool = Query(False),
 ):
-    """
-    FIX real:
-    - No encadenar .select() después de .upsert() (tu supabase-py no lo soporta).
-    - Manejar cuando supabase devuelve None.
-    - Si returning="representation" no existe, hacemos fallback y luego consultamos.
-    """
     session_id = _require_uuid(session_id, "session_id")
     _get_shift_session_or_404(session_id)
 
     platform_id = _require_uuid(payload.platform_id, "platform_id")
     _get_platform_or_404(platform_id)
 
-    # 1) Lookup existing
-    existing_res = (
+    # 1) Lookup existing (SIN maybe_single, SIN cosas raras)
+    existing_res = _sb_execute(
         supabase.table("session_platform_entries")
         .select("id, locked_in")
         .eq("session_id", session_id)
         .eq("platform_id", platform_id)
-        .maybe_single()
-        .execute()
+        .limit(1),
+        "entries lookup",
     )
-
-    if existing_res is None:
-        raise HTTPException(status_code=502, detail="Supabase returned None on existing lookup")
-
-    existing = getattr(existing_res, "data", None)
-
-    # OJO: algunas versiones pueden devolver lista
-    if isinstance(existing, list):
-        existing = existing[0] if existing else None
+    existing = (existing_res.data[0] if existing_res.data else None)
 
     if existing and existing.get("locked_in") and not allow_update_locked:
         raise HTTPException(status_code=409, detail="Entry is locked. Use allow_update_locked=true to update.")
 
-    # 2) Upsert
+    # 2) Upsert (SIN .select() encadenado)
     data = payload.model_dump()
     data["session_id"] = session_id
     data["platform_id"] = platform_id
 
-    try:
-        # Intento A: pedir representación (si tu lib lo soporta)
-        try:
-            res = (
-                supabase.table("session_platform_entries")
-                .upsert(data, on_conflict="session_id,platform_id", returning="representation")
-                .execute()
-            )
-        except TypeError:
-            # Intento B: sin returning (fallback)
-            res = (
-                supabase.table("session_platform_entries")
-                .upsert(data, on_conflict="session_id,platform_id")
-                .execute()
-            )
+    upsert_res = _sb_execute(
+        supabase.table("session_platform_entries").upsert(data, on_conflict="session_id,platform_id"),
+        "entries upsert",
+    )
 
-        if res is None:
-            raise HTTPException(status_code=502, detail="Supabase returned None on upsert")
+    # Supabase puede devolver data o no dependiendo config; si no hay data, OK
+    if not upsert_res.data:
+        return {"ok": True}
 
-        err = getattr(res, "error", None)
-        if err:
-            msg = getattr(err, "message", None) or str(err)
-            raise HTTPException(status_code=400, detail=f"Supabase error: {msg}")
-
-        out = getattr(res, "data", None)
-
-        # Si no devolvió data, consultamos la fila recién guardada
-        if not out:
-            fetch = (
-                supabase.table("session_platform_entries")
-                .select("*")
-                .eq("session_id", session_id)
-                .eq("platform_id", platform_id)
-                .maybe_single()
-                .execute()
-            )
-            if fetch is None:
-                return {"ok": True}
-            fdata = getattr(fetch, "data", None)
-            if isinstance(fdata, list):
-                fdata = fdata[0] if fdata else None
-            return fdata or {"ok": True}
-
-        # out puede venir como lista
-        if isinstance(out, list):
-            return out[0] if out else {"ok": True}
-        return out
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return upsert_res.data[0]
 
 
 # ==========================================================
@@ -630,12 +603,12 @@ def list_rooms(include_inactive: bool = Query(False)):
     q = supabase.table("rooms").select("*").order("name")
     if not include_inactive:
         q = q.eq("active", True)
-    return q.execute().data or []
+    return _sb_execute(q, "list rooms").data or []
 
 
 @app.post("/rooms")
 def create_room(payload: RoomCreate):
-    res = supabase.table("rooms").insert(payload.model_dump()).execute()
+    res = _sb_execute(supabase.table("rooms").insert(payload.model_dump()), "create room")
     if not res.data:
         raise HTTPException(status_code=500, detail="Insert failed: empty response")
     return res.data[0]
@@ -650,7 +623,7 @@ def update_room(room_id: str, payload: RoomUpdate):
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    res = supabase.table("rooms").update(data).eq("id", room_id).execute()
+    res = _sb_execute(supabase.table("rooms").update(data).eq("id", room_id), "update room")
     if not res.data:
         raise HTTPException(status_code=404, detail="Room not found")
     return res.data[0]
@@ -661,7 +634,7 @@ def deactivate_room(room_id: str):
     room_id = _require_uuid(room_id, "room_id")
     _get_room_or_404(room_id)
 
-    res = supabase.table("rooms").update({"active": False}).eq("id", room_id).execute()
+    res = _sb_execute(supabase.table("rooms").update({"active": False}).eq("id", room_id), "deactivate room")
     if not res.data:
         raise HTTPException(status_code=404, detail="Room not found")
     return {"ok": True, "room_id": room_id, "active": False}
@@ -726,7 +699,7 @@ def list_assignments(
     if not include_inactive:
         q = q.eq("active", True)
 
-    return q.execute().data or []
+    return _sb_execute(q, "list assignments").data or []
 
 
 @app.post("/assignments")
@@ -746,7 +719,7 @@ def create_assignment(payload: RoomAssignmentCreate):
     data["room_id"] = _require_uuid(payload.room_id, "room_id")
 
     try:
-        res = supabase.table("room_assignments").insert(data).execute()
+        res = _sb_execute(supabase.table("room_assignments").insert(data), "create assignment")
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed: empty response")
         return res.data[0]
@@ -760,12 +733,9 @@ def create_assignment(payload: RoomAssignmentCreate):
 def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
     assignment_id = _require_uuid(assignment_id, "assignment_id")
 
-    existing = (
-        supabase.table("room_assignments")
-        .select("*")
-        .eq("id", assignment_id)
-        .single()
-        .execute()
+    existing = _sb_execute(
+        supabase.table("room_assignments").select("*").eq("id", assignment_id).single(),
+        "get assignment for update",
     )
     if not existing.data:
         raise HTTPException(status_code=404, detail="Assignment not found")
@@ -778,7 +748,7 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    res = supabase.table("room_assignments").update(data).eq("id", assignment_id).execute()
+    res = _sb_execute(supabase.table("room_assignments").update(data).eq("id", assignment_id), "update assignment")
     if not res.data:
         raise HTTPException(status_code=404, detail="Assignment not found")
     return res.data[0]
@@ -787,7 +757,10 @@ def update_assignment(assignment_id: str, payload: RoomAssignmentUpdate):
 @app.delete("/assignments/{assignment_id}")
 def deactivate_assignment(assignment_id: str):
     assignment_id = _require_uuid(assignment_id, "assignment_id")
-    res = supabase.table("room_assignments").update({"active": False}).eq("id", assignment_id).execute()
+    res = _sb_execute(
+        supabase.table("room_assignments").update({"active": False}).eq("id", assignment_id),
+        "deactivate assignment",
+    )
     if not res.data:
         raise HTTPException(status_code=404, detail="Assignment not found")
     return {"ok": True, "assignment_id": assignment_id, "active": False}

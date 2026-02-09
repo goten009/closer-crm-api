@@ -182,6 +182,17 @@ def _get_shift_session_or_404(session_id: str) -> Dict[str, Any]:
     return res.data
 
 
+def _get_model_platform_or_404(mp_id: str) -> Dict[str, Any]:
+    mp_id = _require_uuid(mp_id, "model_platform_id")
+    res = _sb_execute(
+        supabase.table("model_platforms").select("*").eq("id", mp_id).single(),
+        "get model_platform by id",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model platform relation not found")
+    return res.data
+
+
 def _validate_turn_type(turn_type: str) -> None:
     if turn_type not in ("day", "night"):
         raise HTTPException(status_code=400, detail="turn_type must be 'day' or 'night'")
@@ -395,13 +406,21 @@ class ModelPlatformAssign(BaseModel):
     active: bool = True
 
 
+class ModelPlatformPatch(BaseModel):
+    pct_day: Optional[int] = None
+    pct_night: Optional[int] = None
+    bonus_threshold_usd: Optional[int] = None
+    bonus_pct: Optional[int] = None
+    active: Optional[bool] = None
+
+
 @app.get("/models/{model_id}/platforms")
 def get_model_platforms(model_id: str):
     model_id = _require_uuid(model_id, "model_id")
 
     mp_res = _sb_execute(
         supabase.table("model_platforms")
-        .select("model_id, platform_id, pct_day, pct_night, bonus_threshold_usd, bonus_pct, active")
+        .select("id, model_id, platform_id, pct_day, pct_night, bonus_threshold_usd, bonus_pct, active")
         .eq("model_id", model_id),
         "model_platforms for model",
     )
@@ -429,6 +448,7 @@ def get_model_platforms(model_id: str):
         p = pl_map.get(pid, {})
         out.append(
             {
+                "id": row.get("id"),  # IMPORTANTE para que el frontend pueda desactivar por id si quiere
                 "model_id": row.get("model_id"),
                 "platform_id": pid,
                 "platform_name": p.get("name"),
@@ -468,11 +488,85 @@ def assign_model_platform(model_id: str, payload: ModelPlatformAssign):
         "assign model_platform",
     )
 
-    # Si supabase no retorna data por config, al menos confirmamos OK
     if not res.data:
         return {"ok": True}
 
     return res.data[0]
+
+
+# ✅ Para cuando el frontend desactiva por (model_id, platform_id)
+@app.patch("/models/{model_id}/platforms/{platform_id}")
+def patch_model_platform_by_pair(model_id: str, platform_id: str, payload: ModelPlatformPatch):
+    model_id = _require_uuid(model_id, "model_id")
+    platform_id = _require_uuid(platform_id, "platform_id")
+    _get_model_or_404(model_id)
+    _get_platform_or_404(platform_id)
+
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    res = _sb_execute(
+        supabase.table("model_platforms")
+        .update(data)
+        .eq("model_id", model_id)
+        .eq("platform_id", platform_id),
+        "update model_platform by pair",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model platform relation not found")
+    return res.data[0]
+
+
+@app.delete("/models/{model_id}/platforms/{platform_id}")
+def deactivate_model_platform_by_pair(model_id: str, platform_id: str):
+    model_id = _require_uuid(model_id, "model_id")
+    platform_id = _require_uuid(platform_id, "platform_id")
+    _get_model_or_404(model_id)
+    _get_platform_or_404(platform_id)
+
+    res = _sb_execute(
+        supabase.table("model_platforms")
+        .update({"active": False})
+        .eq("model_id", model_id)
+        .eq("platform_id", platform_id),
+        "deactivate model_platform by pair",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model platform relation not found")
+    return {"ok": True, "model_id": model_id, "platform_id": platform_id, "active": False}
+
+
+# ✅ Para cuando el frontend desactiva por ID (esto es lo que te estaba dando 404)
+@app.patch("/model_platforms/{mp_id}")
+def patch_model_platform_by_id(mp_id: str, payload: ModelPlatformPatch):
+    mp = _get_model_platform_or_404(mp_id)
+
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    res = _sb_execute(
+        supabase.table("model_platforms").update(data).eq("id", mp["id"]),
+        "update model_platform by id",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model platform relation not found")
+    return res.data[0]
+
+
+@app.delete("/model_platforms/{mp_id}")
+def deactivate_model_platform_by_id(mp_id: str):
+    mp = _get_model_platform_or_404(mp_id)
+
+    res = _sb_execute(
+        supabase.table("model_platforms").update({"active": False}).eq("id", mp["id"]),
+        "deactivate model_platform by id",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model platform relation not found")
+
+    return {"ok": True, "id": mp["id"], "active": False}
 
 
 # ==========================================================
@@ -593,7 +687,6 @@ def upsert_session_entry(
     platform_id = _require_uuid(payload.platform_id, "platform_id")
     _get_platform_or_404(platform_id)
 
-    # 1) Lookup existing (SIN maybe_single, SIN cosas raras)
     existing_res = _sb_execute(
         supabase.table("session_platform_entries")
         .select("id, locked_in")
@@ -607,7 +700,6 @@ def upsert_session_entry(
     if existing and existing.get("locked_in") and not allow_update_locked:
         raise HTTPException(status_code=409, detail="Entry is locked. Use allow_update_locked=true to update.")
 
-    # 2) Upsert (SIN .select() encadenado)
     data = payload.model_dump()
     data["session_id"] = session_id
     data["platform_id"] = platform_id
@@ -617,7 +709,6 @@ def upsert_session_entry(
         "entries upsert",
     )
 
-    # Supabase puede devolver data o no dependiendo config; si no hay data, OK
     if not upsert_res.data:
         return {"ok": True}
 

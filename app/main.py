@@ -386,6 +386,15 @@ def deactivate_platform(platform_id: str):
 # ==========================================================
 # MODEL PLATFORMS
 # ==========================================================
+class ModelPlatformAssign(BaseModel):
+    platform_id: str
+    pct_day: int
+    pct_night: int
+    bonus_threshold_usd: int
+    bonus_pct: int
+    active: bool = True
+
+
 @app.get("/models/{model_id}/platforms")
 def get_model_platforms(model_id: str):
     model_id = _require_uuid(model_id, "model_id")
@@ -434,6 +443,36 @@ def get_model_platforms(model_id: str):
             }
         )
     return out
+
+
+@app.post("/models/{model_id}/platforms")
+def assign_model_platform(model_id: str, payload: ModelPlatformAssign):
+    model_id = _require_uuid(model_id, "model_id")
+    _get_model_or_404(model_id)
+
+    platform_id = _require_uuid(payload.platform_id, "platform_id")
+    _get_platform_or_404(platform_id)
+
+    data = {
+        "model_id": model_id,
+        "platform_id": platform_id,
+        "pct_day": payload.pct_day,
+        "pct_night": payload.pct_night,
+        "bonus_threshold_usd": payload.bonus_threshold_usd,
+        "bonus_pct": payload.bonus_pct,
+        "active": payload.active,
+    }
+
+    res = _sb_execute(
+        supabase.table("model_platforms").upsert(data, on_conflict="model_id,platform_id"),
+        "assign model_platform",
+    )
+
+    # Si supabase no retorna data por config, al menos confirmamos OK
+    if not res.data:
+        return {"ok": True}
+
+    return res.data[0]
 
 
 # ==========================================================

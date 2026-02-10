@@ -101,6 +101,10 @@ def _parse_date_any(v) -> Optional[date]:
 
 
 def _require_uuid(value: str, label: str) -> str:
+    """
+    Evita que Supabase reviente con:
+      invalid input syntax for type uuid: "undefined"
+    """
     if value is None:
         raise HTTPException(status_code=400, detail=f"{label} is required")
     if isinstance(value, str) and value.strip().lower() in ("undefined", "null", ""):
@@ -113,6 +117,11 @@ def _require_uuid(value: str, label: str) -> str:
 
 
 def _sb_execute(builder, label: str):
+    """
+    Ejecuta una query de supabase-py de forma segura.
+    - Si Supabase devuelve None, lo convertimos en 502 con contexto
+    - Si hay error, lo devolvemos con detalle
+    """
     try:
         res = builder.execute()
     except Exception as e:
@@ -173,6 +182,17 @@ def _get_shift_session_or_404(session_id: str) -> Dict[str, Any]:
     return res.data
 
 
+def _get_model_platform_or_404(mp_id: str) -> Dict[str, Any]:
+    mp_id = _require_uuid(mp_id, "model_platform_id")
+    res = _sb_execute(
+        supabase.table("model_platforms").select("*").eq("id", mp_id).single(),
+        "get model_platform by id",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model platform relation not found")
+    return res.data
+
+
 def _validate_turn_type(turn_type: str) -> None:
     if turn_type not in ("day", "night"):
         raise HTTPException(status_code=400, detail="turn_type must be 'day' or 'night'")
@@ -190,29 +210,29 @@ def _turn_type_from_shift(shift: Optional[str]) -> Optional[str]:
 
 
 def _default_shift_from_turn_type(turn_type: str) -> str:
-    # Compatibilidad: day -> morning (pero OJO, la UI de monitoreo debe mandar shift real)
     return "night" if turn_type == "night" else "morning"
 
 
-# ✅ FIX CLAVE: NADA de “alt shift”.
-# Cada turno es independiente.
 def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift: str) -> Optional[Dict[str, Any]]:
     model_id = _require_uuid(model_id, "model_id")
-    _validate_shift(shift)
-
     q = (
         supabase.table("room_assignments")
         .select("*")
         .eq("model_id", model_id)
         .eq("assignment_date", str(assignment_date))
-        .eq("shift_slot", shift)
         .eq("active", True)
-        .limit(1)
     )
 
-    exact = _sb_execute(q, "find assignment exact").data
+    exact = _sb_execute(q.eq("shift_slot", shift), "find assignment exact").data
     if exact:
         return exact[0]
+
+    if shift in ("morning", "afternoon"):
+        alt = "afternoon" if shift == "morning" else "morning"
+        alt_res = _sb_execute(q.eq("shift_slot", alt), "find assignment alt").data
+        if alt_res:
+            return alt_res[0]
+
     return None
 
 
@@ -375,28 +395,201 @@ def deactivate_platform(platform_id: str):
 
 
 # ==========================================================
-# SESSIONS  (Opción A: por SHIFT real)
+# MODEL PLATFORMS
+# ==========================================================
+class ModelPlatformAssign(BaseModel):
+    platform_id: str
+    pct_day: Optional[int] = None
+    pct_night: Optional[int] = None
+    bonus_threshold_usd: Optional[int] = None
+    bonus_pct: Optional[int] = None
+    active: bool = True
+
+
+class ModelPlatformPatch(BaseModel):
+    pct_day: Optional[int] = None
+    pct_night: Optional[int] = None
+    bonus_threshold_usd: Optional[int] = None
+    bonus_pct: Optional[int] = None
+    active: Optional[bool] = None
+
+
+@app.get("/models/{model_id}/platforms")
+def get_model_platforms(
+    model_id: str,
+    include_inactive: bool = Query(False, description="true para incluir relaciones inactivas"),
+):
+    model_id = _require_uuid(model_id, "model_id")
+
+    q = (
+        supabase.table("model_platforms")
+        .select("id, model_id, platform_id, pct_day, pct_night, bonus_threshold_usd, bonus_pct, active")
+        .eq("model_id", model_id)
+        .order("created_at", desc=False)
+    )
+    if not include_inactive:
+        q = q.eq("active", True)  # ✅ así, cuando desactivas, desaparece del frontend
+
+    mp_res = _sb_execute(q, "model_platforms for model")
+    mp = mp_res.data or []
+
+    if not mp:
+        return []
+
+    platform_ids = list({row["platform_id"] for row in mp if row.get("platform_id")})
+    if not platform_ids:
+        return []
+
+    pl_res = _sb_execute(
+        supabase.table("platforms")
+        .select("id, name, calc_type, token_usd_rate, active")
+        .in_("id", platform_ids),
+        "platforms for model_platforms",
+    )
+    pl = pl_res.data or []
+    pl_map = {p["id"]: p for p in pl}
+
+    out = []
+    for row in mp:
+        pid = row.get("platform_id")
+        p = pl_map.get(pid, {})
+        out.append(
+            {
+                "id": row.get("id"),
+                "model_id": row.get("model_id"),
+                "platform_id": pid,
+                "platform_name": p.get("name"),
+                "calc_type": p.get("calc_type"),
+                "token_usd_rate": p.get("token_usd_rate"),
+                "platform_active": p.get("active", True),
+                "pct_day": row.get("pct_day"),
+                "pct_night": row.get("pct_night"),
+                "bonus_threshold_usd": row.get("bonus_threshold_usd"),
+                "bonus_pct": row.get("bonus_pct"),
+                "active": row.get("active", True),
+            }
+        )
+    return out
+
+
+@app.post("/models/{model_id}/platforms")
+def assign_model_platform(model_id: str, payload: ModelPlatformAssign):
+    model_id = _require_uuid(model_id, "model_id")
+    _get_model_or_404(model_id)
+
+    platform_id = _require_uuid(payload.platform_id, "platform_id")
+    _get_platform_or_404(platform_id)
+
+    data = {
+        "model_id": model_id,
+        "platform_id": platform_id,
+        "pct_day": payload.pct_day,
+        "pct_night": payload.pct_night,
+        "bonus_threshold_usd": payload.bonus_threshold_usd,
+        "bonus_pct": payload.bonus_pct,
+        "active": payload.active,
+    }
+
+    res = _sb_execute(
+        supabase.table("model_platforms").upsert(data, on_conflict="model_id,platform_id"),
+        "assign model_platform",
+    )
+
+    if not res.data:
+        return {"ok": True}
+
+    return res.data[0]
+
+
+@app.patch("/models/{model_id}/platforms/{platform_id}")
+def patch_model_platform_by_pair(model_id: str, platform_id: str, payload: ModelPlatformPatch):
+    model_id = _require_uuid(model_id, "model_id")
+    platform_id = _require_uuid(platform_id, "platform_id")
+    _get_model_or_404(model_id)
+    _get_platform_or_404(platform_id)
+
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    res = _sb_execute(
+        supabase.table("model_platforms")
+        .update(data)
+        .eq("model_id", model_id)
+        .eq("platform_id", platform_id),
+        "update model_platform by pair",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model platform relation not found")
+    return res.data[0]
+
+
+@app.delete("/models/{model_id}/platforms/{platform_id}")
+def deactivate_model_platform_by_pair(model_id: str, platform_id: str):
+    model_id = _require_uuid(model_id, "model_id")
+    platform_id = _require_uuid(platform_id, "platform_id")
+    _get_model_or_404(model_id)
+    _get_platform_or_404(platform_id)
+
+    res = _sb_execute(
+        supabase.table("model_platforms")
+        .update({"active": False})
+        .eq("model_id", model_id)
+        .eq("platform_id", platform_id),
+        "deactivate model_platform by pair",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model platform relation not found")
+    return {"ok": True, "model_id": model_id, "platform_id": platform_id, "active": False}
+
+
+# (Opcional) Endpoints por ID (por si algún día los usas)
+@app.patch("/model_platforms/{mp_id}")
+def patch_model_platform_by_id(mp_id: str, payload: ModelPlatformPatch):
+    mp = _get_model_platform_or_404(mp_id)
+
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    res = _sb_execute(
+        supabase.table("model_platforms").update(data).eq("id", mp["id"]),
+        "update model_platform by id",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model platform relation not found")
+    return res.data[0]
+
+
+@app.delete("/model_platforms/{mp_id}")
+def deactivate_model_platform_by_id(mp_id: str):
+    mp = _get_model_platform_or_404(mp_id)
+
+    res = _sb_execute(
+        supabase.table("model_platforms").update({"active": False}).eq("id", mp["id"]),
+        "deactivate model_platform by id",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Model platform relation not found")
+
+    return {"ok": True, "id": mp["id"], "active": False}
+
+
+# ==========================================================
+# SESSIONS
 # ==========================================================
 class SessionCreate(BaseModel):
     model_id: str
-
-    # Compatibilidad: puede venir como session_date o date
-    session_date: date = Field(validation_alias=AliasChoices("session_date", "date"))
-
-    # ✅ Nuevo recomendado
-    shift: Optional[str] = Field(default=None, validation_alias=AliasChoices("shift", "shift_slot"))
-
-    # Compatibilidad con lo viejo
-    turn_type: Optional[str] = None
-
+    session_date: date
+    turn_type: str
     notes: Optional[str] = None
+    active: bool = True
 
 
 @app.get("/sessions")
 def list_sessions(
     session_date: Optional[date] = Query(None, description="YYYY-MM-DD"),
     model_id: Optional[str] = None,
-    shift: Optional[str] = Query(None, description="morning|afternoon|night"),
     include_inactive: bool = False,
 ):
     q = supabase.table("shift_sessions").select("*").order("date", desc=True)
@@ -405,9 +598,6 @@ def list_sessions(
         q = q.eq("date", str(session_date))
     if model_id:
         q = q.eq("model_id", _require_uuid(model_id, "model_id"))
-    if shift:
-        _validate_shift(shift)
-        q = q.eq("shift", shift)
 
     if not include_inactive:
         q = q.neq("status", "deleted")
@@ -419,20 +609,10 @@ def list_sessions(
 @app.post("/sessions")
 def create_session(payload: SessionCreate):
     _get_model_or_404(payload.model_id)
+    _validate_turn_type(payload.turn_type)
 
-    # ✅ Decide shift real
-    desired_shift: Optional[str] = None
-    if payload.shift:
-        _validate_shift(payload.shift)
-        desired_shift = payload.shift
-    else:
-        # compat: si todavía mandan turn_type
-        if not payload.turn_type:
-            raise HTTPException(status_code=400, detail="shift is required (or send turn_type for legacy)")
-        _validate_turn_type(payload.turn_type)
-        desired_shift = _default_shift_from_turn_type(payload.turn_type)
+    desired_shift = _default_shift_from_turn_type(payload.turn_type)
 
-    # ✅ OJO: la asignación se busca SOLO en ese shift
     asg = _find_assignment_room_for_model(payload.model_id, payload.session_date, desired_shift)
     if not asg or not asg.get("room_id"):
         raise HTTPException(
@@ -470,6 +650,75 @@ def create_session(payload: SessionCreate):
 def get_session(session_id: str):
     r = _get_shift_session_or_404(session_id)
     return _map_shift_session_row(r)
+
+
+# ==========================================================
+# SESSION PLATFORM ENTRIES
+# tabla: session_platform_entries
+# ==========================================================
+class SessionEntryUpsert(BaseModel):
+    platform_id: str
+
+    value_in: Optional[float] = None
+    value_out: Optional[float] = None
+    tokens: Optional[float] = None
+    usd_value: Optional[float] = None
+    usd_earned: Optional[float] = None
+
+    locked_in: bool = False
+    active: bool = True
+
+
+@app.get("/sessions/{session_id}/entries")
+def list_session_entries(session_id: str):
+    session_id = _require_uuid(session_id, "session_id")
+    _get_shift_session_or_404(session_id)
+
+    rows = _sb_execute(
+        supabase.table("session_platform_entries").select("*").eq("session_id", session_id),
+        "list session entries",
+    ).data or []
+    return rows
+
+
+@app.post("/sessions/{session_id}/entries")
+def upsert_session_entry(
+    session_id: str,
+    payload: SessionEntryUpsert,
+    allow_update_locked: bool = Query(False),
+):
+    session_id = _require_uuid(session_id, "session_id")
+    _get_shift_session_or_404(session_id)
+
+    platform_id = _require_uuid(payload.platform_id, "platform_id")
+    _get_platform_or_404(platform_id)
+
+    existing_res = _sb_execute(
+        supabase.table("session_platform_entries")
+        .select("id, locked_in")
+        .eq("session_id", session_id)
+        .eq("platform_id", platform_id)
+        .limit(1),
+        "entries lookup",
+    )
+    existing = (existing_res.data[0] if existing_res.data else None)
+
+    if existing and existing.get("locked_in") and not allow_update_locked:
+        raise HTTPException(status_code=409, detail="Entry is locked. Use allow_update_locked=true to update.")
+
+    data = payload.model_dump()
+    data["session_id"] = session_id
+    data["platform_id"] = platform_id
+
+    upsert_res = _sb_execute(
+        supabase.table("session_platform_entries").upsert(data, on_conflict="session_id,platform_id"),
+        "entries upsert",
+    )
+
+    if not upsert_res.data:
+        return {"ok": True}
+
+    return upsert_res.data[0]
 
 
 # ==========================================================
@@ -651,3 +900,200 @@ def deactivate_assignment(assignment_id: str):
     if not res.data:
         raise HTTPException(status_code=404, detail="Assignment not found")
     return {"ok": True, "assignment_id": assignment_id, "active": False}
+
+
+# ==========================================================
+# DASHBOARD (Opción A)
+# ==========================================================
+def _safe_float(v) -> float:
+    try:
+        if v is None:
+            return 0.0
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _entry_usd_amount(entry: Dict[str, Any], platform: Dict[str, Any]) -> float:
+    """
+    Convierte una fila de session_platform_entries a USD según la plataforma.
+    Prioridad:
+      1) usd_earned si viene
+      2) según calc_type:
+         - tokens: tokens * token_usd_rate
+         - usd_value: usd_value
+         - usd_delta: (value_out - value_in) o usd_value si viene
+    """
+    if entry.get("usd_earned") is not None:
+        return _safe_float(entry.get("usd_earned"))
+
+    calc_type = platform.get("calc_type")
+    rate = _safe_float(platform.get("token_usd_rate"))
+
+    if calc_type == "tokens":
+        tokens = _safe_float(entry.get("tokens"))
+        return tokens * rate
+
+    if calc_type == "usd_value":
+        if entry.get("usd_value") is not None:
+            return _safe_float(entry.get("usd_value"))
+        tokens = _safe_float(entry.get("tokens"))
+        if tokens and rate:
+            return tokens * rate
+        return 0.0
+
+    # usd_delta
+    if entry.get("usd_value") is not None:
+        return _safe_float(entry.get("usd_value"))
+    vin = _safe_float(entry.get("value_in"))
+    vout = _safe_float(entry.get("value_out"))
+    return vout - vin
+
+
+@app.get("/dashboard/daily")
+def dashboard_daily(
+    session_date: Optional[str] = Query(None, description="YYYY-MM-DD o DD/MM/YYYY", alias="date"),
+):
+    d = _parse_date_any(session_date) if session_date else date.today()
+    d_str = str(d)
+
+    sessions_res = _sb_execute(
+        supabase.table("shift_sessions")
+        .select("*")
+        .eq("date", d_str)
+        .neq("status", "deleted")
+        .order("created_at", desc=False),
+        "dashboard daily sessions",
+    )
+    sessions = sessions_res.data or []
+    mapped_sessions = [_map_shift_session_row(s) for s in sessions]
+
+    if not sessions:
+        return {
+            "date": d_str,
+            "sessions": [],
+            "totals": {"usd_total": 0.0, "by_platform": [], "by_model": []},
+        }
+
+    session_ids = [s["id"] for s in sessions if s.get("id")]
+    model_ids = list({s.get("model_id") for s in sessions if s.get("model_id")})
+    room_ids = list({s.get("room_id") for s in sessions if s.get("room_id")})
+
+    entries_res = _sb_execute(
+        supabase.table("session_platform_entries")
+        .select("*")
+        .in_("session_id", session_ids),
+        "dashboard daily entries",
+    )
+    entries = entries_res.data or []
+    platform_ids = list({e.get("platform_id") for e in entries if e.get("platform_id")})
+
+    models_map: Dict[str, Dict[str, Any]] = {}
+    if model_ids:
+        models_res = _sb_execute(
+            supabase.table("models")
+            .select("id, stage_name, turn_type, active")
+            .in_("id", model_ids),
+            "dashboard daily models",
+        )
+        for m in (models_res.data or []):
+            models_map[m["id"]] = m
+
+    rooms_map: Dict[str, Dict[str, Any]] = {}
+    if room_ids:
+        rooms_res = _sb_execute(
+            supabase.table("rooms").select("id, name, active").in_("id", room_ids),
+            "dashboard daily rooms",
+        )
+        for r in (rooms_res.data or []):
+            rooms_map[r["id"]] = r
+
+    platforms_map: Dict[str, Dict[str, Any]] = {}
+    if platform_ids:
+        plats_res = _sb_execute(
+            supabase.table("platforms")
+            .select("id, name, calc_type, token_usd_rate, active")
+            .in_("id", platform_ids),
+            "dashboard daily platforms",
+        )
+        for p in (plats_res.data or []):
+            platforms_map[p["id"]] = p
+
+    entries_by_session: Dict[str, List[Dict[str, Any]]] = {}
+    for e in entries:
+        sid = e.get("session_id")
+        if sid:
+            entries_by_session.setdefault(sid, []).append(e)
+
+    usd_total = 0.0
+    by_platform: Dict[str, float] = {}
+    by_model: Dict[str, float] = {}
+
+    enriched_sessions = []
+    for s_raw, s_map in zip(sessions, mapped_sessions):
+        mid = s_raw.get("model_id")
+        rid = s_raw.get("room_id")
+        s_entries = entries_by_session.get(s_raw.get("id"), [])
+
+        session_usd = 0.0
+        entries_out = []
+
+        for e in s_entries:
+            pid = e.get("platform_id")
+            p = platforms_map.get(pid, {})
+            amt = _entry_usd_amount(e, p)
+            session_usd += amt
+
+            if pid:
+                by_platform[pid] = by_platform.get(pid, 0.0) + amt
+            if mid:
+                by_model[mid] = by_model.get(mid, 0.0) + amt
+
+            entries_out.append(
+                {
+                    "id": e.get("id"),
+                    "platform_id": pid,
+                    "platform_name": p.get("name"),
+                    "calc_type": p.get("calc_type"),
+                    "token_usd_rate": p.get("token_usd_rate"),
+                    "usd_amount": amt,
+                    "value_in": e.get("value_in"),
+                    "value_out": e.get("value_out"),
+                    "tokens": e.get("tokens"),
+                    "usd_value": e.get("usd_value"),
+                    "usd_earned": e.get("usd_earned"),
+                    "locked_in": e.get("locked_in"),
+                    "active": e.get("active"),
+                }
+            )
+
+        usd_total += session_usd
+
+        m = models_map.get(mid, {})
+        r = rooms_map.get(rid, {})
+
+        enriched_sessions.append(
+            {
+                **s_map,
+                "model_stage_name": m.get("stage_name"),
+                "room_name": r.get("name"),
+                "session_usd": session_usd,
+                "entries": entries_out,
+            }
+        )
+
+    by_platform_out = []
+    for pid, amt in sorted(by_platform.items(), key=lambda x: x[1], reverse=True):
+        p = platforms_map.get(pid, {})
+        by_platform_out.append({"platform_id": pid, "platform_name": p.get("name"), "usd_total": amt})
+
+    by_model_out = []
+    for mid, amt in sorted(by_model.items(), key=lambda x: x[1], reverse=True):
+        m = models_map.get(mid, {})
+        by_model_out.append({"model_id": mid, "model_stage_name": m.get("stage_name"), "usd_total": amt})
+
+    return {
+        "date": d_str,
+        "sessions": enriched_sessions,
+        "totals": {"usd_total": usd_total, "by_platform": by_platform_out, "by_model": by_model_out},
+    }

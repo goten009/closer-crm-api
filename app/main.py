@@ -904,7 +904,7 @@ def deactivate_assignment(assignment_id: str):
 
 
 # ==========================================================
-# DASHBOARD (Opción A)
+# DASHBOARD (Gross vs Payout)
 # ==========================================================
 def _safe_float(v) -> float:
     try:
@@ -915,9 +915,19 @@ def _safe_float(v) -> float:
         return 0.0
 
 
-def _entry_usd_amount(entry: Dict[str, Any], platform: Dict[str, Any]) -> float:
-    if entry.get("usd_earned") is not None:
-        return _safe_float(entry.get("usd_earned"))
+def _entry_gross_amount(entry: Dict[str, Any], platform: Dict[str, Any]) -> float:
+    """
+    GROSS = facturación real de la plataforma (lo que entra antes de % modelo).
+    Prioridad:
+      1) usd_value si viene (ideal, porque tu UI lo está guardando como gross)
+      2) según calc_type:
+         - tokens: tokens * token_usd_rate
+         - usd_value: usd_value (si no venía arriba)
+         - usd_delta: (value_out - value_in)
+      3) fallback: 0
+    """
+    if entry.get("usd_value") is not None:
+        return _safe_float(entry.get("usd_value"))
 
     calc_type = platform.get("calc_type")
     rate = _safe_float(platform.get("token_usd_rate"))
@@ -927,18 +937,25 @@ def _entry_usd_amount(entry: Dict[str, Any], platform: Dict[str, Any]) -> float:
         return tokens * rate
 
     if calc_type == "usd_value":
-        if entry.get("usd_value") is not None:
-            return _safe_float(entry.get("usd_value"))
+        # por si viene en tokens, lo convertimos
         tokens = _safe_float(entry.get("tokens"))
         if tokens and rate:
             return tokens * rate
         return 0.0
 
-    if entry.get("usd_value") is not None:
-        return _safe_float(entry.get("usd_value"))
+    # usd_delta
     vin = _safe_float(entry.get("value_in"))
     vout = _safe_float(entry.get("value_out"))
     return vout - vin
+
+
+def _entry_payout_amount(entry: Dict[str, Any]) -> float:
+    """
+    PAYOUT = lo que gana la modelo (ya con % + bono) si tu UI lo guardó en usd_earned.
+    """
+    if entry.get("usd_earned") is None:
+        return 0.0
+    return _safe_float(entry.get("usd_earned"))
 
 
 @app.get("/dashboard/daily")
@@ -948,12 +965,13 @@ def dashboard_daily(
     d = _parse_date_any(session_date) if session_date else date.today()
     d_str = str(d)
 
+    # ⚠️ IMPORTANTE: tu tabla NO tiene created_at (te daba error).
+    # Ordenamos por id (o por date) para evitar volver a romper.
     sessions_res = _sb_execute(
         supabase.table("shift_sessions")
         .select("*")
         .eq("date", d_str)
         .neq("status", "deleted")
-        # ✅ FIX: shift_sessions no tiene created_at en tu DB, entonces ordenamos por id
         .order("id", desc=False),
         "dashboard daily sessions",
     )
@@ -964,7 +982,17 @@ def dashboard_daily(
         return {
             "date": d_str,
             "sessions": [],
-            "totals": {"usd_total": 0.0, "by_platform": [], "by_model": []},
+            "totals": {
+                # mantenemos usd_total para no romper UI -> ahora será GROSS
+                "usd_total": 0.0,
+                # nuevo: payout_total
+                "payout_total": 0.0,
+                "by_platform": [],
+                "by_model": [],
+                # extra opcional
+                "by_platform_payout": [],
+                "by_model_payout": [],
+            },
         }
 
     session_ids = [s["id"] for s in sessions if s.get("id")]
@@ -1017,9 +1045,16 @@ def dashboard_daily(
         if sid:
             entries_by_session.setdefault(sid, []).append(e)
 
-    usd_total = 0.0
-    by_platform: Dict[str, float] = {}
-    by_model: Dict[str, float] = {}
+    # Totales generales
+    gross_total = 0.0
+    payout_total = 0.0
+
+    # Aggregates
+    by_platform_gross: Dict[str, float] = {}
+    by_model_gross: Dict[str, float] = {}
+
+    by_platform_payout: Dict[str, float] = {}
+    by_model_payout: Dict[str, float] = {}
 
     enriched_sessions = []
     for s_raw, s_map in zip(sessions, mapped_sessions):
@@ -1027,19 +1062,27 @@ def dashboard_daily(
         rid = s_raw.get("room_id")
         s_entries = entries_by_session.get(s_raw.get("id"), [])
 
-        session_usd = 0.0
+        session_gross = 0.0
+        session_payout = 0.0
         entries_out = []
 
         for e in s_entries:
             pid = e.get("platform_id")
             p = platforms_map.get(pid, {})
-            amt = _entry_usd_amount(e, p)
-            session_usd += amt
+
+            gross_amt = _entry_gross_amount(e, p)
+            payout_amt = _entry_payout_amount(e)
+
+            session_gross += gross_amt
+            session_payout += payout_amt
 
             if pid:
-                by_platform[pid] = by_platform.get(pid, 0.0) + amt
+                by_platform_gross[pid] = by_platform_gross.get(pid, 0.0) + gross_amt
+                by_platform_payout[pid] = by_platform_payout.get(pid, 0.0) + payout_amt
+
             if mid:
-                by_model[mid] = by_model.get(mid, 0.0) + amt
+                by_model_gross[mid] = by_model_gross.get(mid, 0.0) + gross_amt
+                by_model_payout[mid] = by_model_payout.get(mid, 0.0) + payout_amt
 
             entries_out.append(
                 {
@@ -1048,7 +1091,12 @@ def dashboard_daily(
                     "platform_name": p.get("name"),
                     "calc_type": p.get("calc_type"),
                     "token_usd_rate": p.get("token_usd_rate"),
-                    "usd_amount": amt,
+
+                    # ✅ nuevos
+                    "gross_amount": gross_amt,
+                    "payout_amount": payout_amt,
+
+                    # raw fields por si quieres debug
                     "value_in": e.get("value_in"),
                     "value_out": e.get("value_out"),
                     "tokens": e.get("tokens"),
@@ -1059,7 +1107,8 @@ def dashboard_daily(
                 }
             )
 
-        usd_total += session_usd
+        gross_total += session_gross
+        payout_total += session_payout
 
         m = models_map.get(mid, {})
         r = rooms_map.get(rid, {})
@@ -1069,23 +1118,47 @@ def dashboard_daily(
                 **s_map,
                 "model_stage_name": m.get("stage_name"),
                 "room_name": r.get("name"),
-                "session_usd": session_usd,
+
+                # ✅ nuevos por sesión
+                "session_gross": session_gross,
+                "session_payout": session_payout,
+
                 "entries": entries_out,
             }
         )
 
+    # Salidas agregadas
     by_platform_out = []
-    for pid, amt in sorted(by_platform.items(), key=lambda x: x[1], reverse=True):
+    for pid, amt in sorted(by_platform_gross.items(), key=lambda x: x[1], reverse=True):
         p = platforms_map.get(pid, {})
         by_platform_out.append({"platform_id": pid, "platform_name": p.get("name"), "usd_total": amt})
 
     by_model_out = []
-    for mid, amt in sorted(by_model.items(), key=lambda x: x[1], reverse=True):
+    for mid, amt in sorted(by_model_gross.items(), key=lambda x: x[1], reverse=True):
         m = models_map.get(mid, {})
         by_model_out.append({"model_id": mid, "model_stage_name": m.get("stage_name"), "usd_total": amt})
+
+    by_platform_payout_out = []
+    for pid, amt in sorted(by_platform_payout.items(), key=lambda x: x[1], reverse=True):
+        p = platforms_map.get(pid, {})
+        by_platform_payout_out.append({"platform_id": pid, "platform_name": p.get("name"), "payout_total": amt})
+
+    by_model_payout_out = []
+    for mid, amt in sorted(by_model_payout.items(), key=lambda x: x[1], reverse=True):
+        m = models_map.get(mid, {})
+        by_model_payout_out.append({"model_id": mid, "model_stage_name": m.get("stage_name"), "payout_total": amt})
 
     return {
         "date": d_str,
         "sessions": enriched_sessions,
-        "totals": {"usd_total": usd_total, "by_platform": by_platform_out, "by_model": by_model_out},
+        "totals": {
+            # ✅ para tu UI actual: ahora esto es GROSS (facturación total)
+            "usd_total": gross_total,
+            # ✅ adicional: payout total (modelo)
+            "payout_total": payout_total,
+            "by_platform": by_platform_out,
+            "by_model": by_model_out,
+            "by_platform_payout": by_platform_payout_out,
+            "by_model_payout": by_model_payout_out,
+        },
     }

@@ -213,26 +213,26 @@ def _default_shift_from_turn_type(turn_type: str) -> str:
     return "night" if turn_type == "night" else "morning"
 
 
+# ✅ CAMBIO CLAVE:
+# Antes: si no existía assignment exacto, hacía fallback morning<->afternoon y eso "pegaba" modelos.
+# Ahora: turnos 100% independientes. NO hay fallback.
 def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift: str) -> Optional[Dict[str, Any]]:
     model_id = _require_uuid(model_id, "model_id")
+    _validate_shift(shift)
+
     q = (
         supabase.table("room_assignments")
         .select("*")
         .eq("model_id", model_id)
         .eq("assignment_date", str(assignment_date))
+        .eq("shift_slot", shift)   # ✅ exacto, sin mezclar morning/afternoon
         .eq("active", True)
+        .limit(1)
     )
 
-    exact = _sb_execute(q.eq("shift_slot", shift), "find assignment exact").data
+    exact = _sb_execute(q, "find assignment exact").data
     if exact:
         return exact[0]
-
-    if shift in ("morning", "afternoon"):
-        alt = "afternoon" if shift == "morning" else "morning"
-        alt_res = _sb_execute(q.eq("shift_slot", alt), "find assignment alt").data
-        if alt_res:
-            return alt_res[0]
-
     return None
 
 
@@ -428,7 +428,7 @@ def get_model_platforms(
         .order("created_at", desc=False)
     )
     if not include_inactive:
-        q = q.eq("active", True)  # ✅ así, cuando desactivas, desaparece del frontend
+        q = q.eq("active", True)
 
     mp_res = _sb_execute(q, "model_platforms for model")
     mp = mp_res.data or []
@@ -543,7 +543,6 @@ def deactivate_model_platform_by_pair(model_id: str, platform_id: str):
     return {"ok": True, "model_id": model_id, "platform_id": platform_id, "active": False}
 
 
-# (Opcional) Endpoints por ID (por si algún día los usas)
 @app.patch("/model_platforms/{mp_id}")
 def patch_model_platform_by_id(mp_id: str, payload: ModelPlatformPatch):
     mp = _get_model_platform_or_404(mp_id)
@@ -581,7 +580,8 @@ def deactivate_model_platform_by_id(mp_id: str):
 class SessionCreate(BaseModel):
     model_id: str
     session_date: date
-    turn_type: str
+    turn_type: str  # ✅ se mantiene para no romper el frontend actual
+    shift: Optional[str] = None  # ✅ nuevo: permite afternoon real sin mezclar turnos
     notes: Optional[str] = None
     active: bool = True
 
@@ -611,7 +611,12 @@ def create_session(payload: SessionCreate):
     _get_model_or_404(payload.model_id)
     _validate_turn_type(payload.turn_type)
 
-    desired_shift = _default_shift_from_turn_type(payload.turn_type)
+    # ✅ CAMBIO: si mandan shift, se respeta. Si no, queda como siempre (day->morning, night->night)
+    if payload.shift:
+        _validate_shift(payload.shift)
+        desired_shift = payload.shift
+    else:
+        desired_shift = _default_shift_from_turn_type(payload.turn_type)
 
     asg = _find_assignment_room_for_model(payload.model_id, payload.session_date, desired_shift)
     if not asg or not asg.get("room_id"):
@@ -915,15 +920,6 @@ def _safe_float(v) -> float:
 
 
 def _entry_usd_amount(entry: Dict[str, Any], platform: Dict[str, Any]) -> float:
-    """
-    Convierte una fila de session_platform_entries a USD según la plataforma.
-    Prioridad:
-      1) usd_earned si viene
-      2) según calc_type:
-         - tokens: tokens * token_usd_rate
-         - usd_value: usd_value
-         - usd_delta: (value_out - value_in) o usd_value si viene
-    """
     if entry.get("usd_earned") is not None:
         return _safe_float(entry.get("usd_earned"))
 
@@ -942,7 +938,6 @@ def _entry_usd_amount(entry: Dict[str, Any], platform: Dict[str, Any]) -> float:
             return tokens * rate
         return 0.0
 
-    # usd_delta
     if entry.get("usd_value") is not None:
         return _safe_float(entry.get("usd_value"))
     vin = _safe_float(entry.get("value_in"))

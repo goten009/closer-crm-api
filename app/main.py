@@ -213,9 +213,7 @@ def _default_shift_from_turn_type(turn_type: str) -> str:
     return "night" if turn_type == "night" else "morning"
 
 
-# ✅ CAMBIO CLAVE:
-# Antes: si no existía assignment exacto, hacía fallback morning<->afternoon y eso "pegaba" modelos.
-# Ahora: turnos 100% independientes. NO hay fallback.
+# ✅ Turnos 100% independientes. NO hay fallback morning<->afternoon
 def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift: str) -> Optional[Dict[str, Any]]:
     model_id = _require_uuid(model_id, "model_id")
     _validate_shift(shift)
@@ -225,7 +223,7 @@ def _find_assignment_room_for_model(model_id: str, assignment_date: date, shift:
         .select("*")
         .eq("model_id", model_id)
         .eq("assignment_date", str(assignment_date))
-        .eq("shift_slot", shift)   # ✅ exacto, sin mezclar morning/afternoon
+        .eq("shift_slot", shift)
         .eq("active", True)
         .limit(1)
     )
@@ -580,8 +578,8 @@ def deactivate_model_platform_by_id(mp_id: str):
 class SessionCreate(BaseModel):
     model_id: str
     session_date: date
-    turn_type: str  # ✅ se mantiene para no romper el frontend actual
-    shift: Optional[str] = None  # ✅ nuevo: permite afternoon real sin mezclar turnos
+    turn_type: str  # se mantiene para no romper el frontend actual
+    shift: Optional[str] = None  # permite afternoon real
     notes: Optional[str] = None
     active: bool = True
 
@@ -611,7 +609,6 @@ def create_session(payload: SessionCreate):
     _get_model_or_404(payload.model_id)
     _validate_turn_type(payload.turn_type)
 
-    # ✅ CAMBIO: si mandan shift, se respeta. Si no, queda como siempre (day->morning, night->night)
     if payload.shift:
         _validate_shift(payload.shift)
         desired_shift = payload.shift
@@ -659,7 +656,6 @@ def get_session(session_id: str):
 
 # ==========================================================
 # SESSION PLATFORM ENTRIES
-# tabla: session_platform_entries
 # ==========================================================
 class SessionEntryUpsert(BaseModel):
     platform_id: str
@@ -957,7 +953,8 @@ def dashboard_daily(
         .select("*")
         .eq("date", d_str)
         .neq("status", "deleted")
-        .order("created_at", desc=False),
+        # ✅ FIX: shift_sessions no tiene created_at en tu DB, entonces ordenamos por id
+        .order("id", desc=False),
         "dashboard daily sessions",
     )
     sessions = sessions_res.data or []

@@ -1,6 +1,6 @@
 import os
 from typing import Optional, Dict, Any, List, Tuple
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from uuid import UUID
 from calendar import monthrange
 
@@ -272,7 +272,10 @@ def _normalize_shift_param(shift_raw: Optional[str]) -> Optional[str]:
         return "afternoon"
     if s in ("noche", "night"):
         return "night"
-    raise HTTPException(status_code=400, detail="shift inválido. Use: mañana|tarde|noche|todos (o morning|afternoon|night|all)")
+    raise HTTPException(
+        status_code=400,
+        detail="shift inválido. Use: mañana|tarde|noche|todos (o morning|afternoon|night|all)",
+    )
 
 
 # ==========================================================
@@ -1014,10 +1017,12 @@ def dashboard_daily(
                 "payout_total": 0.0,     # PAYOUT
                 "by_platform": [],
                 "by_model": [],
-                "by_shift": [],          # del subconjunto (filtrado)
+                "by_shift": [],
                 "by_shift_payout": [],
                 "by_platform_payout": [],
                 "by_model_payout": [],
+                "by_room": [],
+                "by_room_payout": [],
             },
         }
 
@@ -1077,10 +1082,12 @@ def dashboard_daily(
     by_platform_gross: Dict[str, float] = {}
     by_model_gross: Dict[str, float] = {}
     by_shift_gross: Dict[str, float] = {}
+    by_room_gross: Dict[str, float] = {}
 
     by_platform_payout: Dict[str, float] = {}
     by_model_payout: Dict[str, float] = {}
     by_shift_payout: Dict[str, float] = {}
+    by_room_payout: Dict[str, float] = {}
 
     enriched_sessions = []
     for s_raw, s_map in zip(sessions, mapped_sessions):
@@ -1137,6 +1144,10 @@ def dashboard_daily(
             by_shift_gross[s_shift] = by_shift_gross.get(s_shift, 0.0) + session_gross
             by_shift_payout[s_shift] = by_shift_payout.get(s_shift, 0.0) + session_payout
 
+        if rid:
+            by_room_gross[rid] = by_room_gross.get(rid, 0.0) + session_gross
+            by_room_payout[rid] = by_room_payout.get(rid, 0.0) + session_payout
+
         m = models_map.get(mid, {})
         r = rooms_map.get(rid, {})
 
@@ -1163,6 +1174,11 @@ def dashboard_daily(
 
     by_shift_out = [{"shift": k, "usd_total": v} for k, v in sorted(by_shift_gross.items(), key=lambda x: x[1], reverse=True)]
 
+    by_room_out = []
+    for rid, amt in sorted(by_room_gross.items(), key=lambda x: x[1], reverse=True):
+        r = rooms_map.get(rid, {})
+        by_room_out.append({"room_id": rid, "room_name": r.get("name"), "usd_total": amt})
+
     by_platform_payout_out = []
     for pid, amt in sorted(by_platform_payout.items(), key=lambda x: x[1], reverse=True):
         p = platforms_map.get(pid, {})
@@ -1174,6 +1190,11 @@ def dashboard_daily(
         by_model_payout_out.append({"model_id": mid, "model_stage_name": m.get("stage_name"), "payout_total": amt})
 
     by_shift_payout_out = [{"shift": k, "payout_total": v} for k, v in sorted(by_shift_payout.items(), key=lambda x: x[1], reverse=True)]
+
+    by_room_payout_out = []
+    for rid, amt in sorted(by_room_payout.items(), key=lambda x: x[1], reverse=True):
+        r = rooms_map.get(rid, {})
+        by_room_payout_out.append({"room_id": rid, "room_name": r.get("name"), "payout_total": amt})
 
     return {
         "date": d_str,
@@ -1188,6 +1209,8 @@ def dashboard_daily(
             "by_shift_payout": by_shift_payout_out,
             "by_platform_payout": by_platform_payout_out,
             "by_model_payout": by_model_payout_out,
+            "by_room": by_room_out,
+            "by_room_payout": by_room_payout_out,
         },
     }
 
@@ -1244,11 +1267,14 @@ def dashboard_fortnight(
                 "by_shift_payout": [],
                 "by_platform_payout": [],
                 "by_model_payout": [],
+                "by_room": [],
+                "by_room_payout": [],
             },
         }
 
     session_ids = [s["id"] for s in sessions if s.get("id")]
     model_ids = list({s.get("model_id") for s in sessions if s.get("model_id")})
+    room_ids = list({s.get("room_id") for s in sessions if s.get("room_id")})
 
     entries_res = _sb_execute(
         supabase.table("session_platform_entries")
@@ -1269,6 +1295,15 @@ def dashboard_fortnight(
         )
         for m in (models_res.data or []):
             models_map[m["id"]] = m
+
+    rooms_map: Dict[str, Dict[str, Any]] = {}
+    if room_ids:
+        rooms_res = _sb_execute(
+            supabase.table("rooms").select("id, name, active").in_("id", room_ids),
+            "dashboard fortnight rooms",
+        )
+        for r in (rooms_res.data or []):
+            rooms_map[r["id"]] = r
 
     platforms_map: Dict[str, Dict[str, Any]] = {}
     if platform_ids:
@@ -1293,15 +1328,18 @@ def dashboard_fortnight(
     by_model_gross: Dict[str, float] = {}
     by_platform_gross: Dict[str, float] = {}
     by_shift_gross: Dict[str, float] = {}
+    by_room_gross: Dict[str, float] = {}
 
     by_model_payout: Dict[str, float] = {}
     by_platform_payout: Dict[str, float] = {}
     by_shift_payout: Dict[str, float] = {}
+    by_room_payout: Dict[str, float] = {}
 
     enriched_sessions = []
     for s_raw, s_map in zip(sessions, mapped_sessions):
         sid = s_raw.get("id")
         mid = s_raw.get("model_id")
+        rid = s_raw.get("room_id")
         s_shift = s_raw.get("shift")  # morning/afternoon/night
 
         s_entries = entries_by_session.get(sid, [])
@@ -1333,29 +1371,55 @@ def dashboard_fortnight(
             by_shift_gross[s_shift] = by_shift_gross.get(s_shift, 0.0) + session_gross
             by_shift_payout[s_shift] = by_shift_payout.get(s_shift, 0.0) + session_payout
 
+        if rid:
+            by_room_gross[rid] = by_room_gross.get(rid, 0.0) + session_gross
+            by_room_payout[rid] = by_room_payout.get(rid, 0.0) + session_payout
+
         m = models_map.get(mid, {})
+        r = rooms_map.get(rid, {})
         enriched_sessions.append(
             {
                 **s_map,
                 "model_stage_name": m.get("stage_name"),
+                "room_name": r.get("name"),
                 "session_gross": session_gross,
                 "session_payout": session_payout,
             }
         )
 
-    by_platform_out = [{"platform_id": pid, "platform_name": platforms_map.get(pid, {}).get("name"), "usd_total": amt}
-                       for pid, amt in sorted(by_platform_gross.items(), key=lambda x: x[1], reverse=True)]
-    by_model_out = [{"model_id": mid, "model_stage_name": models_map.get(mid, {}).get("stage_name"), "usd_total": amt}
-                    for mid, amt in sorted(by_model_gross.items(), key=lambda x: x[1], reverse=True)]
-    by_shift_out = [{"shift": sh, "usd_total": amt}
-                    for sh, amt in sorted(by_shift_gross.items(), key=lambda x: x[1], reverse=True)]
+    by_platform_out = [
+        {"platform_id": pid, "platform_name": platforms_map.get(pid, {}).get("name"), "usd_total": amt}
+        for pid, amt in sorted(by_platform_gross.items(), key=lambda x: x[1], reverse=True)
+    ]
+    by_model_out = [
+        {"model_id": mid, "model_stage_name": models_map.get(mid, {}).get("stage_name"), "usd_total": amt}
+        for mid, amt in sorted(by_model_gross.items(), key=lambda x: x[1], reverse=True)
+    ]
+    by_shift_out = [
+        {"shift": sh, "usd_total": amt}
+        for sh, amt in sorted(by_shift_gross.items(), key=lambda x: x[1], reverse=True)
+    ]
+    by_room_out = [
+        {"room_id": rid, "room_name": rooms_map.get(rid, {}).get("name"), "usd_total": amt}
+        for rid, amt in sorted(by_room_gross.items(), key=lambda x: x[1], reverse=True)
+    ]
 
-    by_platform_payout_out = [{"platform_id": pid, "platform_name": platforms_map.get(pid, {}).get("name"), "payout_total": amt}
-                              for pid, amt in sorted(by_platform_payout.items(), key=lambda x: x[1], reverse=True)]
-    by_model_payout_out = [{"model_id": mid, "model_stage_name": models_map.get(mid, {}).get("stage_name"), "payout_total": amt}
-                           for mid, amt in sorted(by_model_payout.items(), key=lambda x: x[1], reverse=True)]
-    by_shift_payout_out = [{"shift": sh, "payout_total": amt}
-                           for sh, amt in sorted(by_shift_payout.items(), key=lambda x: x[1], reverse=True)]
+    by_platform_payout_out = [
+        {"platform_id": pid, "platform_name": platforms_map.get(pid, {}).get("name"), "payout_total": amt}
+        for pid, amt in sorted(by_platform_payout.items(), key=lambda x: x[1], reverse=True)
+    ]
+    by_model_payout_out = [
+        {"model_id": mid, "model_stage_name": models_map.get(mid, {}).get("stage_name"), "payout_total": amt}
+        for mid, amt in sorted(by_model_payout.items(), key=lambda x: x[1], reverse=True)
+    ]
+    by_shift_payout_out = [
+        {"shift": sh, "payout_total": amt}
+        for sh, amt in sorted(by_shift_payout.items(), key=lambda x: x[1], reverse=True)
+    ]
+    by_room_payout_out = [
+        {"room_id": rid, "room_name": rooms_map.get(rid, {}).get("name"), "payout_total": amt}
+        for rid, amt in sorted(by_room_payout.items(), key=lambda x: x[1], reverse=True)
+    ]
 
     return {
         "range": {"start": start_str, "end": end_str, "half": half},
@@ -1370,5 +1434,7 @@ def dashboard_fortnight(
             "by_shift_payout": by_shift_payout_out,
             "by_platform_payout": by_platform_payout_out,
             "by_model_payout": by_model_payout_out,
+            "by_room": by_room_out,
+            "by_room_payout": by_room_payout_out,
         },
     }

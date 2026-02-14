@@ -2,6 +2,7 @@ import os
 from typing import Optional, Dict, Any, List
 from datetime import date, datetime
 from uuid import UUID
+from calendar import monthrange
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -937,13 +938,11 @@ def _entry_gross_amount(entry: Dict[str, Any], platform: Dict[str, Any]) -> floa
         return tokens * rate
 
     if calc_type == "usd_value":
-        # por si viene en tokens, lo convertimos
         tokens = _safe_float(entry.get("tokens"))
         if tokens and rate:
             return tokens * rate
         return 0.0
 
-    # usd_delta
     vin = _safe_float(entry.get("value_in"))
     vout = _safe_float(entry.get("value_out"))
     return vout - vin
@@ -965,8 +964,6 @@ def dashboard_daily(
     d = _parse_date_any(session_date) if session_date else date.today()
     d_str = str(d)
 
-    # ⚠️ IMPORTANTE: tu tabla NO tiene created_at (te daba error).
-    # Ordenamos por id (o por date) para evitar volver a romper.
     sessions_res = _sb_execute(
         supabase.table("shift_sessions")
         .select("*")
@@ -983,13 +980,10 @@ def dashboard_daily(
             "date": d_str,
             "sessions": [],
             "totals": {
-                # mantenemos usd_total para no romper UI -> ahora será GROSS
-                "usd_total": 0.0,
-                # nuevo: payout_total
-                "payout_total": 0.0,
+                "usd_total": 0.0,        # GROSS
+                "payout_total": 0.0,     # PAYOUT
                 "by_platform": [],
                 "by_model": [],
-                # extra opcional
                 "by_platform_payout": [],
                 "by_model_payout": [],
             },
@@ -1045,11 +1039,9 @@ def dashboard_daily(
         if sid:
             entries_by_session.setdefault(sid, []).append(e)
 
-    # Totales generales
     gross_total = 0.0
     payout_total = 0.0
 
-    # Aggregates
     by_platform_gross: Dict[str, float] = {}
     by_model_gross: Dict[str, float] = {}
 
@@ -1091,12 +1083,8 @@ def dashboard_daily(
                     "platform_name": p.get("name"),
                     "calc_type": p.get("calc_type"),
                     "token_usd_rate": p.get("token_usd_rate"),
-
-                    # ✅ nuevos
                     "gross_amount": gross_amt,
                     "payout_amount": payout_amt,
-
-                    # raw fields por si quieres debug
                     "value_in": e.get("value_in"),
                     "value_out": e.get("value_out"),
                     "tokens": e.get("tokens"),
@@ -1118,16 +1106,12 @@ def dashboard_daily(
                 **s_map,
                 "model_stage_name": m.get("stage_name"),
                 "room_name": r.get("name"),
-
-                # ✅ nuevos por sesión
                 "session_gross": session_gross,
                 "session_payout": session_payout,
-
                 "entries": entries_out,
             }
         )
 
-    # Salidas agregadas
     by_platform_out = []
     for pid, amt in sorted(by_platform_gross.items(), key=lambda x: x[1], reverse=True):
         p = platforms_map.get(pid, {})
@@ -1152,13 +1136,207 @@ def dashboard_daily(
         "date": d_str,
         "sessions": enriched_sessions,
         "totals": {
-            # ✅ para tu UI actual: ahora esto es GROSS (facturación total)
-            "usd_total": gross_total,
-            # ✅ adicional: payout total (modelo)
-            "payout_total": payout_total,
+            "usd_total": gross_total,        # ✅ GROSS
+            "payout_total": payout_total,    # ✅ PAYOUT
             "by_platform": by_platform_out,
             "by_model": by_model_out,
             "by_platform_payout": by_platform_payout_out,
             "by_model_payout": by_model_payout_out,
+        },
+    }
+
+
+# ==========================================================
+# DASHBOARD (Fortnight: 1-15 / 16-fin)
+# ==========================================================
+def _fortnight_range(d: date) -> tuple[date, date, int]:
+    last_day = monthrange(d.year, d.month)[1]
+    if d.day <= 15:
+        return date(d.year, d.month, 1), date(d.year, d.month, 15), 1
+    return date(d.year, d.month, 16), date(d.year, d.month, last_day), 2
+
+
+@app.get("/dashboard/fortnight")
+def dashboard_fortnight(
+    session_date: Optional[str] = Query(None, description="YYYY-MM-DD o DD/MM/YYYY", alias="date"),
+):
+    d = _parse_date_any(session_date) if session_date else date.today()
+    start_d, end_d, half = _fortnight_range(d)
+
+    start_str = str(start_d)
+    end_str = str(end_d)
+
+    sessions_res = _sb_execute(
+        supabase.table("shift_sessions")
+        .select("*")
+        .gte("date", start_str)
+        .lte("date", end_str)
+        .neq("status", "deleted")
+        .order("date", desc=False),
+        "dashboard fortnight sessions",
+    )
+    sessions = sessions_res.data or []
+    mapped_sessions = [_map_shift_session_row(s) for s in sessions]
+
+    if not sessions:
+        return {
+            "range": {"start": start_str, "end": end_str, "half": half},
+            "sessions": [],
+            "totals": {
+                "usd_total": 0.0,        # GROSS
+                "payout_total": 0.0,     # PAYOUT
+                "by_platform": [],
+                "by_model": [],
+                "by_turn": [],
+                "by_shift": [],
+                "by_platform_payout": [],
+                "by_model_payout": [],
+                "by_turn_payout": [],
+                "by_shift_payout": [],
+            },
+        }
+
+    session_ids = [s["id"] for s in sessions if s.get("id")]
+    model_ids = list({s.get("model_id") for s in sessions if s.get("model_id")})
+
+    entries_res = _sb_execute(
+        supabase.table("session_platform_entries")
+        .select("*")
+        .in_("session_id", session_ids),
+        "dashboard fortnight entries",
+    )
+    entries = entries_res.data or []
+    platform_ids = list({e.get("platform_id") for e in entries if e.get("platform_id")})
+
+    models_map: Dict[str, Dict[str, Any]] = {}
+    if model_ids:
+        models_res = _sb_execute(
+            supabase.table("models")
+            .select("id, stage_name, active")
+            .in_("id", model_ids),
+            "dashboard fortnight models",
+        )
+        for m in (models_res.data or []):
+            models_map[m["id"]] = m
+
+    platforms_map: Dict[str, Dict[str, Any]] = {}
+    if platform_ids:
+        plats_res = _sb_execute(
+            supabase.table("platforms")
+            .select("id, name, calc_type, token_usd_rate, active")
+            .in_("id", platform_ids),
+            "dashboard fortnight platforms",
+        )
+        for p in (plats_res.data or []):
+            platforms_map[p["id"]] = p
+
+    entries_by_session: Dict[str, List[Dict[str, Any]]] = {}
+    for e in entries:
+        sid = e.get("session_id")
+        if sid:
+            entries_by_session.setdefault(sid, []).append(e)
+
+    gross_total = 0.0
+    payout_total = 0.0
+
+    by_model_gross: Dict[str, float] = {}
+    by_platform_gross: Dict[str, float] = {}
+    by_turn_gross: Dict[str, float] = {}   # day/night
+    by_shift_gross: Dict[str, float] = {}  # morning/afternoon/night
+
+    by_model_payout: Dict[str, float] = {}
+    by_platform_payout: Dict[str, float] = {}
+    by_turn_payout: Dict[str, float] = {}
+    by_shift_payout: Dict[str, float] = {}
+
+    enriched_sessions = []
+    for s_raw, s_map in zip(sessions, mapped_sessions):
+        sid = s_raw.get("id")
+        mid = s_raw.get("model_id")
+        shift = s_raw.get("shift")  # morning/afternoon/night
+        turn = _turn_type_from_shift(shift) or "day"  # day/night
+
+        s_entries = entries_by_session.get(sid, [])
+        session_gross = 0.0
+        session_payout = 0.0
+
+        for e in s_entries:
+            pid = e.get("platform_id")
+            p = platforms_map.get(pid, {})
+
+            gross_amt = _entry_gross_amount(e, p)
+            payout_amt = _entry_payout_amount(e)
+
+            session_gross += gross_amt
+            session_payout += payout_amt
+
+            if mid:
+                by_model_gross[mid] = by_model_gross.get(mid, 0.0) + gross_amt
+                by_model_payout[mid] = by_model_payout.get(mid, 0.0) + payout_amt
+
+            if pid:
+                by_platform_gross[pid] = by_platform_gross.get(pid, 0.0) + gross_amt
+                by_platform_payout[pid] = by_platform_payout.get(pid, 0.0) + payout_amt
+
+        gross_total += session_gross
+        payout_total += session_payout
+
+        by_turn_gross[turn] = by_turn_gross.get(turn, 0.0) + session_gross
+        by_turn_payout[turn] = by_turn_payout.get(turn, 0.0) + session_payout
+
+        if shift:
+            by_shift_gross[shift] = by_shift_gross.get(shift, 0.0) + session_gross
+            by_shift_payout[shift] = by_shift_payout.get(shift, 0.0) + session_payout
+
+        m = models_map.get(mid, {})
+        enriched_sessions.append(
+            {
+                **s_map,
+                "model_stage_name": m.get("stage_name"),
+                "session_gross": session_gross,
+                "session_payout": session_payout,
+            }
+        )
+
+    by_platform_out = []
+    for pid, amt in sorted(by_platform_gross.items(), key=lambda x: x[1], reverse=True):
+        p = platforms_map.get(pid, {})
+        by_platform_out.append({"platform_id": pid, "platform_name": p.get("name"), "usd_total": amt})
+
+    by_model_out = []
+    for mid, amt in sorted(by_model_gross.items(), key=lambda x: x[1], reverse=True):
+        m = models_map.get(mid, {})
+        by_model_out.append({"model_id": mid, "model_stage_name": m.get("stage_name"), "usd_total": amt})
+
+    by_turn_out = [{"turn_type": k, "usd_total": v} for k, v in sorted(by_turn_gross.items(), key=lambda x: x[1], reverse=True)]
+    by_shift_out = [{"shift": k, "usd_total": v} for k, v in sorted(by_shift_gross.items(), key=lambda x: x[1], reverse=True)]
+
+    by_platform_payout_out = []
+    for pid, amt in sorted(by_platform_payout.items(), key=lambda x: x[1], reverse=True):
+        p = platforms_map.get(pid, {})
+        by_platform_payout_out.append({"platform_id": pid, "platform_name": p.get("name"), "payout_total": amt})
+
+    by_model_payout_out = []
+    for mid, amt in sorted(by_model_payout.items(), key=lambda x: x[1], reverse=True):
+        m = models_map.get(mid, {})
+        by_model_payout_out.append({"model_id": mid, "model_stage_name": m.get("stage_name"), "payout_total": amt})
+
+    by_turn_payout_out = [{"turn_type": k, "payout_total": v} for k, v in sorted(by_turn_payout.items(), key=lambda x: x[1], reverse=True)]
+    by_shift_payout_out = [{"shift": k, "payout_total": v} for k, v in sorted(by_shift_payout.items(), key=lambda x: x[1], reverse=True)]
+
+    return {
+        "range": {"start": start_str, "end": end_str, "half": half},
+        "sessions": enriched_sessions,
+        "totals": {
+            "usd_total": gross_total,        # ✅ GROSS
+            "payout_total": payout_total,    # ✅ PAYOUT
+            "by_platform": by_platform_out,
+            "by_model": by_model_out,
+            "by_turn": by_turn_out,
+            "by_shift": by_shift_out,
+            "by_platform_payout": by_platform_payout_out,
+            "by_model_payout": by_model_payout_out,
+            "by_turn_payout": by_turn_payout_out,
+            "by_shift_payout": by_shift_payout_out,
         },
     }

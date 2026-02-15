@@ -1438,3 +1438,439 @@ def dashboard_fortnight(
             "by_room_payout": by_room_payout_out,
         },
     }
+
+
+# ==========================================================
+# STORE / TIENDA (DESCUENTOS POR NÓMINA)
+# ==========================================================
+
+# Reglas: tienda por tipo (monitores/juguetes/adelantos/multas)
+# No hay pagos. Solo cargos a modelos + cuotas en 1-3 quincenas.
+
+_STORE_SHOP_TYPES = {"monitores", "juguetes", "adelantos", "multas"}
+_STORE_PRODUCT_TYPES = {"physical", "digital", "service"}
+_STORE_CHARGE_STATUS = {"draft", "scheduled", "void"}
+_STORE_INSTALLMENT_STATUS = {"pending", "applied", "void"}
+
+
+def _validate_shop_type(shop_type: str) -> None:
+    s = (shop_type or "").strip().lower()
+    if s not in _STORE_SHOP_TYPES:
+        raise HTTPException(status_code=400, detail="shop_type inválido. Use: monitores|juguetes|adelantos|multas")
+
+
+def _validate_product_type(product_type: str) -> None:
+    s = (product_type or "").strip().lower()
+    if s not in _STORE_PRODUCT_TYPES:
+        raise HTTPException(status_code=400, detail="product_type inválido. Use: physical|digital|service")
+
+
+def _validate_installments_count(n: int) -> None:
+    if n is None:
+        raise HTTPException(status_code=400, detail="installments_count is required")
+    if int(n) < 1 or int(n) > 3:
+        raise HTTPException(status_code=400, detail="installments_count must be 1..3")
+
+
+def _fortnight_key_from_date(d: date) -> Tuple[int, int, int]:
+    half = 1 if d.day <= 15 else 2
+    return d.year, d.month, half
+
+
+def _next_fortnight_key(year: int, month: int, half: int) -> Tuple[int, int, int]:
+    if half == 1:
+        return year, month, 2
+    # half==2 => next month half 1
+    if month == 12:
+        return year + 1, 1, 1
+    return year, month + 1, 1
+
+
+def _get_charge_or_404(charge_id: str) -> Dict[str, Any]:
+    charge_id = _require_uuid(charge_id, "charge_id")
+    res = _sb_execute(
+        supabase.table("store_charges").select("*").eq("id", charge_id).single(),
+        "get store_charge",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Charge not found")
+    return res.data
+
+
+def _get_product_or_404(product_id: str) -> Dict[str, Any]:
+    product_id = _require_uuid(product_id, "product_id")
+    res = _sb_execute(
+        supabase.table("store_products").select("*").eq("id", product_id).single(),
+        "get store_product",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return res.data
+
+
+def _recalc_charge_totals(charge_id: str) -> Dict[str, float]:
+    charge_id = _require_uuid(charge_id, "charge_id")
+    items = _sb_execute(
+        supabase.table("store_charge_items").select("line_total_usd").eq("charge_id", charge_id),
+        "recalc charge items",
+    ).data or []
+
+    subtotal = 0.0
+    for it in items:
+        try:
+            subtotal += float(it.get("line_total_usd") or 0)
+        except Exception:
+            subtotal += 0.0
+
+    total = subtotal
+
+    _sb_execute(
+        supabase.table("store_charges").update(
+            {"subtotal_usd": subtotal, "total_usd": total, "updated_at": datetime.utcnow().isoformat()}
+        ).eq("id", charge_id),
+        "update charge totals",
+    )
+
+    return {"subtotal_usd": subtotal, "total_usd": total}
+
+
+# =========================
+# Schemas - Products
+# =========================
+class StoreProductCreate(BaseModel):
+    shop_type: str = Field(default="monitores")
+    name: str
+    sku: Optional[str] = None
+    product_type: str = Field(default="physical")
+    unit_price_usd: float = Field(default=0, ge=0)
+    unit_cost_usd: Optional[float] = None
+    is_active: bool = True
+
+
+class StoreProductUpdate(BaseModel):
+    shop_type: Optional[str] = None
+    name: Optional[str] = None
+    sku: Optional[str] = None
+    product_type: Optional[str] = None
+    unit_price_usd: Optional[float] = None
+    unit_cost_usd: Optional[float] = None
+    is_active: Optional[bool] = None
+
+
+# =========================
+# Schemas - Charges
+# =========================
+class StoreChargeCreate(BaseModel):
+    model_id: str
+    shop_type: str = Field(default="monitores")
+    installments_count: int = Field(default=1, ge=1, le=3)
+    start_date: Optional[date] = None
+    notes: Optional[str] = None
+    created_by: Optional[str] = None
+
+
+class StoreChargeItemAdd(BaseModel):
+    product_id: Optional[str] = None
+    description: Optional[str] = None
+    qty: float = Field(default=1, gt=0)
+    unit_price_usd: float = Field(default=0, ge=0)
+
+
+class StoreChargeFinalize(BaseModel):
+    installments_count: Optional[int] = Field(default=None, ge=1, le=3)
+
+
+# =========================
+# PRODUCTS endpoints
+# =========================
+@app.get("/store/products")
+def store_list_products(
+    shop_type: Optional[str] = Query(default=None),
+    active_only: bool = True,
+):
+    q = supabase.table("store_products").select("*").order("name", desc=False)
+    if active_only:
+        q = q.eq("is_active", True)
+    if shop_type:
+        _validate_shop_type(shop_type)
+        q = q.eq("shop_type", shop_type)
+
+    return {"items": _sb_execute(q, "store list products").data or []}
+
+
+@app.post("/store/products")
+def store_create_product(payload: StoreProductCreate):
+    _validate_shop_type(payload.shop_type)
+    _validate_product_type(payload.product_type)
+
+    data = payload.model_dump()
+    data["updated_at"] = datetime.utcnow().isoformat()
+
+    res = _sb_execute(supabase.table("store_products").insert(data), "store create product")
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Insert failed: empty response")
+    return {"item": res.data[0]}
+
+
+@app.patch("/store/products/{product_id}")
+def store_update_product(product_id: str, payload: StoreProductUpdate):
+    product_id = _require_uuid(product_id, "product_id")
+    _get_product_or_404(product_id)
+
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    if "shop_type" in data:
+        _validate_shop_type(str(data["shop_type"]))
+    if "product_type" in data:
+        _validate_product_type(str(data["product_type"]))
+
+    data["updated_at"] = datetime.utcnow().isoformat()
+
+    res = _sb_execute(supabase.table("store_products").update(data).eq("id", product_id), "store update product")
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"item": res.data[0]}
+
+
+# =========================
+# CHARGES endpoints
+# =========================
+@app.post("/store/charges")
+def store_create_charge(payload: StoreChargeCreate):
+    _validate_shop_type(payload.shop_type)
+    _validate_installments_count(payload.installments_count)
+
+    model_id = _require_uuid(payload.model_id, "model_id")
+    _get_model_or_404(model_id)
+
+    d = payload.start_date or date.today()
+    y, m, half = _fortnight_key_from_date(d)
+
+    data = {
+        "model_id": model_id,
+        "shop_type": payload.shop_type,
+        "status": "draft",
+        "installments_count": int(payload.installments_count),
+        "start_year": int(y),
+        "start_month": int(m),
+        "start_half": int(half),
+        "notes": payload.notes,
+        "subtotal_usd": 0,
+        "total_usd": 0,
+        "created_by": payload.created_by,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    res = _sb_execute(supabase.table("store_charges").insert(data), "store create charge")
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Insert failed: empty response")
+    return {"charge": res.data[0]}
+
+
+@app.get("/store/charges")
+def store_list_charges(
+    status: Optional[str] = Query(default=None),
+    model_id: Optional[str] = Query(default=None),
+    shop_type: Optional[str] = Query(default=None),
+    limit: int = 50,
+):
+    q = supabase.table("store_charges").select("*").order("created_at", desc=True).limit(limit)
+
+    if status:
+        s = status.strip().lower()
+        if s not in _STORE_CHARGE_STATUS:
+            raise HTTPException(status_code=400, detail="status inválido. Use: draft|scheduled|void")
+        q = q.eq("status", s)
+
+    if model_id:
+        q = q.eq("model_id", _require_uuid(model_id, "model_id"))
+
+    if shop_type:
+        _validate_shop_type(shop_type)
+        q = q.eq("shop_type", shop_type)
+
+    return {"items": _sb_execute(q, "store list charges").data or []}
+
+
+@app.get("/store/charges/{charge_id}")
+def store_get_charge(charge_id: str):
+    charge = _get_charge_or_404(charge_id)
+
+    items = _sb_execute(
+        supabase.table("store_charge_items").select("*").eq("charge_id", charge["id"]).order("created_at", desc=False),
+        "store get charge items",
+    ).data or []
+
+    installments = _sb_execute(
+        supabase.table("store_charge_installments")
+        .select("*")
+        .eq("charge_id", charge["id"])
+        .order("due_year", desc=False)
+        .order("due_month", desc=False)
+        .order("due_half", desc=False),
+        "store get charge installments",
+    ).data or []
+
+    return {"charge": charge, "items": items, "installments": installments}
+
+
+@app.post("/store/charges/{charge_id}/items")
+def store_add_charge_item(charge_id: str, payload: StoreChargeItemAdd):
+    charge = _get_charge_or_404(charge_id)
+    if charge.get("status") != "draft":
+        raise HTTPException(status_code=400, detail="Cannot modify items when charge is not draft")
+
+    product_id = None
+    description = (payload.description or "").strip() if payload.description else ""
+    qty = float(payload.qty or 1)
+    unit_price = float(payload.unit_price_usd or 0)
+
+    if payload.product_id:
+        product_id = _require_uuid(payload.product_id, "product_id")
+        p = _get_product_or_404(product_id)
+
+        # Si no mandan description, usamos nombre del producto
+        if not description:
+            description = p.get("name") or "Item"
+
+        # Si no mandan price (0), tomamos el unit_price_usd del producto
+        if unit_price == 0:
+            try:
+                unit_price = float(p.get("unit_price_usd") or 0)
+            except Exception:
+                unit_price = 0.0
+
+    if not description:
+        description = "Item"
+
+    line_total = round(qty * unit_price, 2)
+
+    ins = {
+        "charge_id": charge["id"],
+        "product_id": product_id,
+        "description": description,
+        "qty": qty,
+        "unit_price_usd": unit_price,
+        "line_total_usd": line_total,
+    }
+
+    res = _sb_execute(supabase.table("store_charge_items").insert(ins), "store add charge item")
+    _recalc_charge_totals(charge["id"])
+
+    if not res.data:
+        return {"ok": True, "charge": _get_charge_or_404(charge["id"])}
+
+    return {"item": res.data[0], "charge": _get_charge_or_404(charge["id"])}
+
+
+@app.delete("/store/charges/{charge_id}/items/{item_id}")
+def store_remove_charge_item(charge_id: str, item_id: str):
+    charge = _get_charge_or_404(charge_id)
+    if charge.get("status") != "draft":
+        raise HTTPException(status_code=400, detail="Cannot modify items when charge is not draft")
+
+    item_id = _require_uuid(item_id, "item_id")
+
+    _sb_execute(
+        supabase.table("store_charge_items").delete().eq("id", item_id).eq("charge_id", charge["id"]),
+        "store delete charge item",
+    )
+
+    totals = _recalc_charge_totals(charge["id"])
+    return {"ok": True, "totals": totals, "charge": _get_charge_or_404(charge["id"])}
+
+
+@app.post("/store/charges/{charge_id}/finalize")
+def store_finalize_charge(charge_id: str, payload: StoreChargeFinalize):
+    charge = _get_charge_or_404(charge_id)
+
+    if charge.get("status") != "draft":
+        raise HTTPException(status_code=400, detail="Only draft charges can be finalized")
+
+    # Debe tener items
+    items = _sb_execute(
+        supabase.table("store_charge_items").select("id").eq("charge_id", charge["id"]).limit(1),
+        "store charge items existence",
+    ).data or []
+    if not items:
+        raise HTTPException(status_code=400, detail="Add at least one item before finalizing")
+
+    # Recalcular total
+    totals = _recalc_charge_totals(charge["id"])
+    total = float(totals.get("total_usd") or 0.0)
+
+    # installments_count (puede venir para ajustar antes de programar)
+    inst_count = int(charge.get("installments_count") or 1)
+    if payload.installments_count is not None:
+        _validate_installments_count(payload.installments_count)
+        inst_count = int(payload.installments_count)
+
+        _sb_execute(
+            supabase.table("store_charges").update(
+                {"installments_count": inst_count, "updated_at": datetime.utcnow().isoformat()}
+            ).eq("id", charge["id"]),
+            "store update charge installments_count",
+        )
+
+    # Borrar cuotas previas (si re-finalizas)
+    _sb_execute(
+        supabase.table("store_charge_installments").delete().eq("charge_id", charge["id"]),
+        "store delete prior installments",
+    )
+
+    # Dividir total en inst_count cuotas (redondeo exacto)
+    base = round(total / inst_count, 2)
+    amounts = [base] * inst_count
+    diff = round(total - sum(amounts), 2)
+    amounts[-1] = round(amounts[-1] + diff, 2)
+
+    y = int(charge.get("start_year"))
+    m = int(charge.get("start_month"))
+    half = int(charge.get("start_half"))
+
+    rows = []
+    for i in range(inst_count):
+        rows.append(
+            {
+                "charge_id": charge["id"],
+                "due_year": y,
+                "due_month": m,
+                "due_half": half,
+                "amount_usd": float(amounts[i]),
+                "status": "pending",
+            }
+        )
+        y, m, half = _next_fortnight_key(y, m, half)
+
+    _sb_execute(
+        supabase.table("store_charge_installments").insert(rows),
+        "store insert installments",
+    )
+
+    _sb_execute(
+        supabase.table("store_charges").update({"status": "scheduled", "updated_at": datetime.utcnow().isoformat()}).eq("id", charge["id"]),
+        "store set charge scheduled",
+    )
+
+    return store_get_charge(charge["id"])
+
+
+@app.post("/store/charges/{charge_id}/void")
+def store_void_charge(charge_id: str):
+    charge = _get_charge_or_404(charge_id)
+
+    if charge.get("status") == "void":
+        return {"ok": True, "charge": charge}
+
+    _sb_execute(
+        supabase.table("store_charges").update({"status": "void", "updated_at": datetime.utcnow().isoformat()}).eq("id", charge["id"]),
+        "store void charge",
+    )
+    _sb_execute(
+        supabase.table("store_charge_installments").update({"status": "void"}).eq("charge_id", charge["id"]),
+        "store void installments",
+    )
+
+    return {"ok": True, "charge": _get_charge_or_404(charge["id"])}

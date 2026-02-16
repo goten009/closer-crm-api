@@ -1578,7 +1578,6 @@ def _store_decrement_stock(product_id: str, qty_int: int) -> Dict[str, Any]:
         "rpc store_decrement_stock",
     )
 
-    # La RPC retorna "data" como lista de filas o un objeto (según cliente).
     data = res.data
     if isinstance(data, list):
         row = data[0] if data else None
@@ -1586,7 +1585,6 @@ def _store_decrement_stock(product_id: str, qty_int: int) -> Dict[str, Any]:
         row = data
 
     if not row:
-        # Si por alguna razón no devolvió nada:
         return {"ok": True, "new_stock": None}
 
     return {"ok": bool(row.get("ok")), "new_stock": row.get("new_stock")}
@@ -1615,6 +1613,22 @@ class StoreProductUpdate(BaseModel):
     unit_cost_usd: Optional[float] = None
     stock_qty: Optional[int] = None  # ✅ NUEVO
     is_active: Optional[bool] = None
+
+
+# =========================
+# Schemas - Stock adjustments (NUEVO)
+# =========================
+class StoreAdjustStock(BaseModel):
+    qty: int = Field(..., ge=0)
+    mode: str = Field(..., description="add | set")
+
+    @field_validator("mode")
+    @classmethod
+    def _v_mode(cls, v):
+        s = (v or "").strip().lower()
+        if s not in ("add", "set"):
+            raise ValueError("mode must be 'add' or 'set'")
+        return s
 
 
 # =========================
@@ -1695,6 +1709,73 @@ def store_update_product(product_id: str, payload: StoreProductUpdate):
     if not res.data:
         raise HTTPException(status_code=404, detail="Product not found")
     return {"item": res.data[0]}
+
+
+# =========================
+# NUEVO: Ajuste de inventario (sumar / set)
+# =========================
+@app.post("/store/products/{product_id}/adjust-stock")
+def store_adjust_stock(product_id: str, payload: StoreAdjustStock):
+    """
+    Ajuste de inventario:
+      - mode=add : suma qty al stock actual
+      - mode=set : deja el stock EXACTAMENTE en qty
+    Nota:
+      - Si stock_qty es NULL y mode=add -> error (no hay control de stock).
+      - Si stock_qty es NULL y mode=set -> se habilita control dejando stock en qty.
+    """
+    product_id = _require_uuid(product_id, "product_id")
+    prod = _get_product_or_404(product_id)
+
+    current = prod.get("stock_qty")
+
+    if payload.mode == "add":
+        if current is None:
+            raise HTTPException(status_code=400, detail="Product has no stock control (stock_qty is null). Use mode='set' first.")
+        new_stock = int(current) + int(payload.qty)
+    else:  # set
+        new_stock = int(payload.qty)
+
+    if new_stock < 0:
+        raise HTTPException(status_code=400, detail="Stock cannot be negative")
+
+    res = _sb_execute(
+        supabase.table("store_products")
+        .update({"stock_qty": new_stock, "updated_at": datetime.utcnow().isoformat()})
+        .eq("id", product_id),
+        "store adjust stock",
+    )
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    return {"ok": True, "item": res.data[0]}
+
+
+# =========================
+# NUEVO: "Eliminar" producto = desactivar (soft delete)
+# =========================
+@app.delete("/store/products/{product_id}")
+def store_deactivate_product(product_id: str):
+    """
+    "Eliminar" producto = desactivarlo (soft delete):
+      - is_active = false
+    (No borramos histórico.)
+    """
+    product_id = _require_uuid(product_id, "product_id")
+    _get_product_or_404(product_id)
+
+    res = _sb_execute(
+        supabase.table("store_products")
+        .update({"is_active": False, "updated_at": datetime.utcnow().isoformat()})
+        .eq("id", product_id),
+        "store deactivate product",
+    )
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    return {"ok": True, "id": product_id, "is_active": False}
 
 
 # =========================

@@ -1534,6 +1534,64 @@ def _recalc_charge_totals(charge_id: str) -> Dict[str, float]:
     return {"subtotal_usd": subtotal, "total_usd": total}
 
 
+def _validate_stock_qty(v: Optional[int]) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        iv = int(v)
+    except Exception:
+        raise HTTPException(status_code=400, detail="stock_qty must be integer or null")
+    if iv < 0:
+        raise HTTPException(status_code=400, detail="stock_qty cannot be negative")
+    return iv
+
+
+def _qty_to_int_for_stock(qty: float) -> int:
+    """
+    Para inventario físico, exigimos cantidad entera.
+    """
+    try:
+        q = float(qty)
+    except Exception:
+        raise HTTPException(status_code=400, detail="qty must be a number")
+
+    if q <= 0:
+        raise HTTPException(status_code=400, detail="qty must be > 0")
+
+    if abs(q - round(q)) > 1e-9:
+        raise HTTPException(status_code=400, detail="qty must be an integer for physical stock items")
+
+    return int(round(q))
+
+
+def _store_decrement_stock(product_id: str, qty_int: int) -> Dict[str, Any]:
+    """
+    Llama al RPC: public.store_decrement_stock(p_product_id uuid, p_qty integer)
+    Retorna: { ok: bool, new_stock: int|null }
+    """
+    product_id = _require_uuid(product_id, "product_id")
+    if qty_int <= 0:
+        raise HTTPException(status_code=400, detail="qty must be >= 1")
+
+    res = _sb_execute(
+        supabase.rpc("store_decrement_stock", {"p_product_id": product_id, "p_qty": int(qty_int)}),
+        "rpc store_decrement_stock",
+    )
+
+    # La RPC retorna "data" como lista de filas o un objeto (según cliente).
+    data = res.data
+    if isinstance(data, list):
+        row = data[0] if data else None
+    else:
+        row = data
+
+    if not row:
+        # Si por alguna razón no devolvió nada:
+        return {"ok": True, "new_stock": None}
+
+    return {"ok": bool(row.get("ok")), "new_stock": row.get("new_stock")}
+
+
 # =========================
 # Schemas - Products
 # =========================
@@ -1544,6 +1602,7 @@ class StoreProductCreate(BaseModel):
     product_type: str = Field(default="physical")
     unit_price_usd: float = Field(default=0, ge=0)
     unit_cost_usd: Optional[float] = None
+    stock_qty: Optional[int] = None  # ✅ NUEVO
     is_active: bool = True
 
 
@@ -1554,6 +1613,7 @@ class StoreProductUpdate(BaseModel):
     product_type: Optional[str] = None
     unit_price_usd: Optional[float] = None
     unit_cost_usd: Optional[float] = None
+    stock_qty: Optional[int] = None  # ✅ NUEVO
     is_active: Optional[bool] = None
 
 
@@ -1604,6 +1664,7 @@ def store_create_product(payload: StoreProductCreate):
     _validate_product_type(payload.product_type)
 
     data = payload.model_dump()
+    data["stock_qty"] = _validate_stock_qty(data.get("stock_qty"))
     data["updated_at"] = datetime.utcnow().isoformat()
 
     res = _sb_execute(supabase.table("store_products").insert(data), "store create product")
@@ -1625,6 +1686,8 @@ def store_update_product(product_id: str, payload: StoreProductUpdate):
         _validate_shop_type(str(data["shop_type"]))
     if "product_type" in data:
         _validate_product_type(str(data["product_type"]))
+    if "stock_qty" in data:
+        data["stock_qty"] = _validate_stock_qty(data.get("stock_qty"))
 
     data["updated_at"] = datetime.utcnow().isoformat()
 
@@ -1727,18 +1790,22 @@ def store_add_charge_item(charge_id: str, payload: StoreChargeItemAdd):
     qty = float(payload.qty or 1)
     unit_price = float(payload.unit_price_usd or 0)
 
+    product_row: Optional[Dict[str, Any]] = None
+    product_type = None
+
     if payload.product_id:
         product_id = _require_uuid(payload.product_id, "product_id")
-        p = _get_product_or_404(product_id)
+        product_row = _get_product_or_404(product_id)
+        product_type = (product_row.get("product_type") or "").strip().lower()
 
         # Si no mandan description, usamos nombre del producto
         if not description:
-            description = p.get("name") or "Item"
+            description = product_row.get("name") or "Item"
 
         # Si no mandan price (0), tomamos el unit_price_usd del producto
         if unit_price == 0:
             try:
-                unit_price = float(p.get("unit_price_usd") or 0)
+                unit_price = float(product_row.get("unit_price_usd") or 0)
             except Exception:
                 unit_price = 0.0
 
@@ -1756,13 +1823,47 @@ def store_add_charge_item(charge_id: str, payload: StoreChargeItemAdd):
         "line_total_usd": line_total,
     }
 
-    res = _sb_execute(supabase.table("store_charge_items").insert(ins), "store add charge item")
+    # 1) Insertar el item
+    inserted = _sb_execute(supabase.table("store_charge_items").insert(ins), "store add charge item")
+    if not inserted.data:
+        raise HTTPException(status_code=500, detail="Insert failed: empty response")
+
+    item = inserted.data[0]
+
+    # 2) Descontar inventario si aplica
+    #    Solo: product_id presente + product_type == physical + stock_qty NOT NULL
+    if product_id and product_row:
+        try:
+            if (product_type or "") == "physical" and product_row.get("stock_qty") is not None:
+                qty_int = _qty_to_int_for_stock(qty)
+                r = _store_decrement_stock(product_id, qty_int)
+
+                if not r.get("ok"):
+                    # rollback: borrar item y recalcular
+                    _sb_execute(
+                        supabase.table("store_charge_items").delete().eq("id", item["id"]),
+                        "rollback item (no stock)",
+                    )
+                    _recalc_charge_totals(charge["id"])
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Stock insuficiente para '{product_row.get('name')}'. Disponible: {r.get('new_stock')}",
+                    )
+        except HTTPException:
+            raise
+        except Exception as e:
+            # rollback por cualquier fallo raro en RPC
+            _sb_execute(
+                supabase.table("store_charge_items").delete().eq("id", item["id"]),
+                "rollback item (rpc error)",
+            )
+            _recalc_charge_totals(charge["id"])
+            raise HTTPException(status_code=500, detail=f"Stock update failed: {str(e)}")
+
+    # 3) Recalcular totales
     _recalc_charge_totals(charge["id"])
 
-    if not res.data:
-        return {"ok": True, "charge": _get_charge_or_404(charge["id"])}
-
-    return {"item": res.data[0], "charge": _get_charge_or_404(charge["id"])}
+    return {"item": item, "charge": _get_charge_or_404(charge["id"])}
 
 
 @app.delete("/store/charges/{charge_id}/items/{item_id}")

@@ -1439,7 +1439,6 @@ def dashboard_fortnight(
         },
     }
 
-
 # ==========================================================
 # STORE / TIENDA (DESCUENTOS POR NÓMINA)
 # ==========================================================
@@ -1590,6 +1589,98 @@ def _store_decrement_stock(product_id: str, qty_int: int) -> Dict[str, Any]:
     return {"ok": bool(row.get("ok")), "new_stock": row.get("new_stock")}
 
 
+def _store_increment_stock_direct(product_id: str, qty_int: int) -> None:
+    """
+    Re-stock simple (sin RPC) para deshacer un item.
+    - Solo se usa si el producto tiene stock_qty != NULL y es physical.
+    """
+    product_id = _require_uuid(product_id, "product_id")
+    if qty_int <= 0:
+        return
+
+    prod = _get_product_or_404(product_id)
+    current = prod.get("stock_qty")
+    if current is None:
+        # sin control de stock, no hacemos nada
+        return
+
+    new_stock = int(current) + int(qty_int)
+    _sb_execute(
+        supabase.table("store_products")
+        .update({"stock_qty": new_stock, "updated_at": datetime.utcnow().isoformat()})
+        .eq("id", product_id),
+        "restock product",
+    )
+
+
+def _has_any_applied_installment(charge_id: str) -> bool:
+    rows = _sb_execute(
+        supabase.table("store_charge_installments")
+        .select("id,status")
+        .eq("charge_id", _require_uuid(charge_id, "charge_id")),
+        "check applied installments",
+    ).data or []
+    for r in rows:
+        if (r.get("status") or "").strip().lower() == "applied":
+            return True
+    return False
+
+
+def _replan_installments_keep_schedule(charge: Dict[str, Any]) -> None:
+    """
+    Recalcula cuotas (amount_usd) manteniendo:
+      - mismo start_year/start_month/start_half
+      - mismo installments_count
+    Solo si NO hay cuotas applied.
+    """
+    if charge.get("status") != "scheduled":
+        return
+
+    if _has_any_applied_installment(charge["id"]):
+        raise HTTPException(status_code=409, detail="No se puede ajustar: ya hay cuotas aplicadas (applied).")
+
+    # recalcular total desde items
+    totals = _recalc_charge_totals(charge["id"])
+    total = float(totals.get("total_usd") or 0.0)
+
+    inst_count = int(charge.get("installments_count") or 1)
+    _validate_installments_count(inst_count)
+
+    # borrar cuotas pendientes/void anteriores y recrear en pending
+    _sb_execute(
+        supabase.table("store_charge_installments").delete().eq("charge_id", charge["id"]),
+        "delete installments for replan",
+    )
+
+    base = round(total / inst_count, 2)
+    amounts = [base] * inst_count
+    diff = round(total - sum(amounts), 2)
+    amounts[-1] = round(amounts[-1] + diff, 2)
+
+    y = int(charge.get("start_year"))
+    m = int(charge.get("start_month"))
+    half = int(charge.get("start_half"))
+
+    rows = []
+    for i in range(inst_count):
+        rows.append(
+            {
+                "charge_id": charge["id"],
+                "due_year": y,
+                "due_month": m,
+                "due_half": half,
+                "amount_usd": float(amounts[i]),
+                "status": "pending",
+            }
+        )
+        y, m, half = _next_fortnight_key(y, m, half)
+
+    _sb_execute(
+        supabase.table("store_charge_installments").insert(rows),
+        "insert replanned installments",
+    )
+
+
 # =========================
 # Schemas - Products
 # =========================
@@ -1600,7 +1691,7 @@ class StoreProductCreate(BaseModel):
     product_type: str = Field(default="physical")
     unit_price_usd: float = Field(default=0, ge=0)
     unit_cost_usd: Optional[float] = None
-    stock_qty: Optional[int] = None  # ✅ NUEVO
+    stock_qty: Optional[int] = None
     is_active: bool = True
 
 
@@ -1611,12 +1702,12 @@ class StoreProductUpdate(BaseModel):
     product_type: Optional[str] = None
     unit_price_usd: Optional[float] = None
     unit_cost_usd: Optional[float] = None
-    stock_qty: Optional[int] = None  # ✅ NUEVO
+    stock_qty: Optional[int] = None
     is_active: Optional[bool] = None
 
 
 # =========================
-# Schemas - Stock adjustments (NUEVO)
+# Schemas - Stock adjustments
 # =========================
 class StoreAdjustStock(BaseModel):
     qty: int = Field(..., ge=0)
@@ -1651,6 +1742,7 @@ class StoreChargeItemAdd(BaseModel):
 
 
 class StoreChargeFinalize(BaseModel):
+    # ✅ opcional para no exigir body nunca
     installments_count: Optional[int] = Field(default=None, ge=1, le=3)
 
 
@@ -1711,9 +1803,6 @@ def store_update_product(product_id: str, payload: StoreProductUpdate):
     return {"item": res.data[0]}
 
 
-# =========================
-# NUEVO: Ajuste de inventario (sumar / set)
-# =========================
 @app.post("/store/products/{product_id}/adjust-stock")
 def store_adjust_stock(product_id: str, payload: StoreAdjustStock):
     """
@@ -1752,9 +1841,6 @@ def store_adjust_stock(product_id: str, payload: StoreAdjustStock):
     return {"ok": True, "item": res.data[0]}
 
 
-# =========================
-# NUEVO: "Eliminar" producto = desactivar (soft delete)
-# =========================
 @app.delete("/store/products/{product_id}")
 def store_deactivate_product(product_id: str):
     """
@@ -1860,6 +1946,66 @@ def store_get_charge(charge_id: str):
     return {"charge": charge, "items": items, "installments": installments}
 
 
+# ✅ NUEVO: ver TODO lo asignado a una modelo (cargos + items + cuotas)
+@app.get("/store/models/{model_id}/assignments")
+def store_model_assignments(model_id: str, limit: int = 200):
+    model_id = _require_uuid(model_id, "model_id")
+    _get_model_or_404(model_id)
+
+    charges = _sb_execute(
+        supabase.table("store_charges")
+        .select("*")
+        .eq("model_id", model_id)
+        .order("created_at", desc=True)
+        .limit(limit),
+        "store model charges",
+    ).data or []
+
+    if not charges:
+        return {"model_id": model_id, "items": []}
+
+    charge_ids = [c["id"] for c in charges if c.get("id")]
+
+    items = _sb_execute(
+        supabase.table("store_charge_items")
+        .select("*")
+        .in_("charge_id", charge_ids)
+        .order("created_at", desc=True),
+        "store model charge items",
+    ).data or []
+
+    installments = _sb_execute(
+        supabase.table("store_charge_installments")
+        .select("*")
+        .in_("charge_id", charge_ids)
+        .order("due_year", desc=False)
+        .order("due_month", desc=False)
+        .order("due_half", desc=False),
+        "store model charge installments",
+    ).data or []
+
+    items_by_charge: Dict[str, List[Dict[str, Any]]] = {}
+    for it in items:
+        items_by_charge.setdefault(it.get("charge_id"), []).append(it)
+
+    inst_by_charge: Dict[str, List[Dict[str, Any]]] = {}
+    for ins in installments:
+        inst_by_charge.setdefault(ins.get("charge_id"), []).append(ins)
+
+    out = []
+    for ch in charges:
+        cid = ch.get("id")
+        out.append(
+            {
+                "charge": ch,
+                "items": items_by_charge.get(cid, []),
+                "installments": inst_by_charge.get(cid, []),
+            }
+        )
+
+    return {"model_id": model_id, "items": out}
+
+
 @app.post("/store/charges/{charge_id}/items")
 def store_add_charge_item(charge_id: str, payload: StoreChargeItemAdd):
     charge = _get_charge_or_404(charge_id)
@@ -1879,11 +2025,9 @@ def store_add_charge_item(charge_id: str, payload: StoreChargeItemAdd):
         product_row = _get_product_or_404(product_id)
         product_type = (product_row.get("product_type") or "").strip().lower()
 
-        # Si no mandan description, usamos nombre del producto
         if not description:
             description = product_row.get("name") or "Item"
 
-        # Si no mandan price (0), tomamos el unit_price_usd del producto
         if unit_price == 0:
             try:
                 unit_price = float(product_row.get("unit_price_usd") or 0)
@@ -1904,15 +2048,13 @@ def store_add_charge_item(charge_id: str, payload: StoreChargeItemAdd):
         "line_total_usd": line_total,
     }
 
-    # 1) Insertar el item
     inserted = _sb_execute(supabase.table("store_charge_items").insert(ins), "store add charge item")
     if not inserted.data:
         raise HTTPException(status_code=500, detail="Insert failed: empty response")
 
     item = inserted.data[0]
 
-    # 2) Descontar inventario si aplica
-    #    Solo: product_id presente + product_type == physical + stock_qty NOT NULL
+    # Descontar inventario si aplica
     if product_id and product_row:
         try:
             if (product_type or "") == "physical" and product_row.get("stock_qty") is not None:
@@ -1920,7 +2062,6 @@ def store_add_charge_item(charge_id: str, payload: StoreChargeItemAdd):
                 r = _store_decrement_stock(product_id, qty_int)
 
                 if not r.get("ok"):
-                    # rollback: borrar item y recalcular
                     _sb_execute(
                         supabase.table("store_charge_items").delete().eq("id", item["id"]),
                         "rollback item (no stock)",
@@ -1933,7 +2074,6 @@ def store_add_charge_item(charge_id: str, payload: StoreChargeItemAdd):
         except HTTPException:
             raise
         except Exception as e:
-            # rollback por cualquier fallo raro en RPC
             _sb_execute(
                 supabase.table("store_charge_items").delete().eq("id", item["id"]),
                 "rollback item (rpc error)",
@@ -1941,31 +2081,74 @@ def store_add_charge_item(charge_id: str, payload: StoreChargeItemAdd):
             _recalc_charge_totals(charge["id"])
             raise HTTPException(status_code=500, detail=f"Stock update failed: {str(e)}")
 
-    # 3) Recalcular totales
     _recalc_charge_totals(charge["id"])
 
     return {"item": item, "charge": _get_charge_or_404(charge["id"])}
 
 
+# ✅ MEJORADO: eliminar item (draft) y ADEMÁS permitir en scheduled si NO hay applied
 @app.delete("/store/charges/{charge_id}/items/{item_id}")
 def store_remove_charge_item(charge_id: str, item_id: str):
     charge = _get_charge_or_404(charge_id)
-    if charge.get("status") != "draft":
-        raise HTTPException(status_code=400, detail="Cannot modify items when charge is not draft")
-
     item_id = _require_uuid(item_id, "item_id")
 
+    # traer item completo para poder restock
+    item_res = _sb_execute(
+        supabase.table("store_charge_items").select("*").eq("id", item_id).eq("charge_id", charge["id"]).single(),
+        "get item to delete",
+    )
+    item = item_res.data
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    status = (charge.get("status") or "").strip().lower()
+
+    if status == "void":
+        raise HTTPException(status_code=400, detail="Charge is void. No se puede modificar.")
+
+    if status == "scheduled":
+        # si ya se aplicó alguna cuota, no dejamos borrar
+        if _has_any_applied_installment(charge["id"]):
+            raise HTTPException(status_code=409, detail="No se puede borrar: ya hay cuotas aplicadas (applied).")
+
+    # borrar item
     _sb_execute(
         supabase.table("store_charge_items").delete().eq("id", item_id).eq("charge_id", charge["id"]),
         "store delete charge item",
     )
 
+    # restock si aplica
+    try:
+        pid = item.get("product_id")
+        if pid:
+            prod = _get_product_or_404(pid)
+            ptype = (prod.get("product_type") or "").strip().lower()
+            if ptype == "physical" and prod.get("stock_qty") is not None:
+                qty_int = _qty_to_int_for_stock(float(item.get("qty") or 0))
+                _store_increment_stock_direct(pid, qty_int)
+    except Exception:
+        # no tumbamos la operación por restock (pero queda loggable si lo deseas después)
+        pass
+
     totals = _recalc_charge_totals(charge["id"])
-    return {"ok": True, "totals": totals, "charge": _get_charge_or_404(charge["id"])}
+
+    # si estaba scheduled, replanea cuotas para que cuadre con el nuevo total
+    if status == "scheduled":
+        _replan_installments_keep_schedule(_get_charge_or_404(charge["id"]))
+
+    return {
+        "ok": True,
+        "totals": totals,
+        "charge": _get_charge_or_404(charge["id"]),
+        "full": store_get_charge(charge["id"]),
+    }
 
 
+# ✅ FIX: finalize SIN body obligatorio (payload opcional)
 @app.post("/store/charges/{charge_id}/finalize")
-def store_finalize_charge(charge_id: str, payload: StoreChargeFinalize):
+def store_finalize_charge(charge_id: str, payload: Optional[StoreChargeFinalize] = None):
+    payload = payload or StoreChargeFinalize()
+
     charge = _get_charge_or_404(charge_id)
 
     if charge.get("status") != "draft":
@@ -2032,7 +2215,9 @@ def store_finalize_charge(charge_id: str, payload: StoreChargeFinalize):
     )
 
     _sb_execute(
-        supabase.table("store_charges").update({"status": "scheduled", "updated_at": datetime.utcnow().isoformat()}).eq("id", charge["id"]),
+        supabase.table("store_charges")
+        .update({"status": "scheduled", "updated_at": datetime.utcnow().isoformat()})
+        .eq("id", charge["id"]),
         "store set charge scheduled",
     )
 
@@ -2047,7 +2232,9 @@ def store_void_charge(charge_id: str):
         return {"ok": True, "charge": charge}
 
     _sb_execute(
-        supabase.table("store_charges").update({"status": "void", "updated_at": datetime.utcnow().isoformat()}).eq("id", charge["id"]),
+        supabase.table("store_charges")
+        .update({"status": "void", "updated_at": datetime.utcnow().isoformat()})
+        .eq("id", charge["id"]),
         "store void charge",
     )
     _sb_execute(

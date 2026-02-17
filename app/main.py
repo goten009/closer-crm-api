@@ -1,4 +1,5 @@
 import os
+from pydantic import ConfigDict
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import date, datetime
 from uuid import UUID
@@ -2243,3 +2244,389 @@ def store_void_charge(charge_id: str):
     )
 
     return {"ok": True, "charge": _get_charge_or_404(charge["id"])}
+# ==========================================================
+# PAYROLL SOURCES + MODEL PLATFORM ACCOUNTS + REPORT GENERATE
+# (NEUM-style)
+# ==========================================================
+
+def _norm_user(u: Optional[str]) -> str:
+    return (u or "").strip().lower()
+
+# -------------------------
+# Schemas: Income Sources
+# -------------------------
+class IncomeSourceCreate(BaseModel):
+    platform_id: str
+    alias: str
+    api_key_enc: str
+    source_type: str = "studio_master"  # studio_master | individual
+    username: Optional[str] = None      # master username si aplica
+    monetizer_name: Optional[str] = None
+    is_active: bool = True
+    is_hidden: bool = False
+
+class IncomeSourceUpdate(BaseModel):
+    alias: Optional[str] = None
+    api_key_enc: Optional[str] = None
+    source_type: Optional[str] = None
+    username: Optional[str] = None
+    monetizer_name: Optional[str] = None
+    is_active: Optional[bool] = None
+    is_hidden: Optional[bool] = None
+
+@app.get("/income-sources")
+def list_income_sources(
+    platform_id: Optional[str] = None,
+    active_only: bool = True,
+    include_hidden: bool = False,
+):
+    q = supabase.table("platform_income_sources").select("*").order("created_at", desc=True)
+    if platform_id:
+        q = q.eq("platform_id", _require_uuid(platform_id, "platform_id"))
+    if active_only:
+        q = q.eq("is_active", True)
+    if not include_hidden:
+        q = q.eq("is_hidden", False)
+
+    return _sb_execute(q, "list income_sources").data or []
+
+@app.post("/income-sources")
+def create_income_source(payload: IncomeSourceCreate):
+    platform_id = _require_uuid(payload.platform_id, "platform_id")
+    _get_platform_or_404(platform_id)
+
+    data = payload.model_dump()
+    data["platform_id"] = platform_id
+
+    res = _sb_execute(supabase.table("platform_income_sources").insert(data), "create income_source")
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Insert failed: empty response")
+    return res.data[0]
+
+@app.get("/income-sources/{income_source_id}")
+def get_income_source(income_source_id: str):
+    income_source_id = _require_uuid(income_source_id, "income_source_id")
+    res = _sb_execute(
+        supabase.table("platform_income_sources").select("*").eq("id", income_source_id).single(),
+        "get income_source",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Income source not found")
+    return res.data
+
+@app.patch("/income-sources/{income_source_id}")
+def update_income_source(income_source_id: str, payload: IncomeSourceUpdate):
+    income_source_id = _require_uuid(income_source_id, "income_source_id")
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    res = _sb_execute(
+        supabase.table("platform_income_sources").update(data).eq("id", income_source_id),
+        "update income_source",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Income source not found")
+    return res.data[0]
+
+@app.delete("/income-sources/{income_source_id}")
+def deactivate_income_source(income_source_id: str):
+    income_source_id = _require_uuid(income_source_id, "income_source_id")
+    res = _sb_execute(
+        supabase.table("platform_income_sources").update({"is_active": False}).eq("id", income_source_id),
+        "deactivate income_source",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Income source not found")
+    return {"ok": True, "id": income_source_id, "is_active": False}
+
+
+# -------------------------
+# Schemas: Model Platform Accounts
+# (esta es la grilla de "Plataformas" por modelo)
+# -------------------------
+class ModelPlatformAccountUpsert(BaseModel):
+    platform_id: str
+    username: str
+    password_enc: Optional[str] = None
+    autologin_enabled: bool = False
+    is_active: bool = True
+
+class ModelPlatformAccountPatch(BaseModel):
+    username: Optional[str] = None
+    password_enc: Optional[str] = None
+    autologin_enabled: Optional[bool] = None
+    is_active: Optional[bool] = None
+
+@app.get("/models/{model_id}/accounts")
+def list_model_accounts(model_id: str, include_inactive: bool = False):
+    model_id = _require_uuid(model_id, "model_id")
+    _get_model_or_404(model_id)
+
+    q = (
+        supabase.table("model_platform_accounts")
+        .select("*")
+        .eq("model_id", model_id)
+        .order("created_at", desc=False)
+    )
+    if not include_inactive:
+        q = q.eq("is_active", True)
+
+    rows = _sb_execute(q, "list model_platform_accounts").data or []
+    if not rows:
+        return []
+
+    platform_ids = list({r.get("platform_id") for r in rows if r.get("platform_id")})
+    pl_map = {}
+    if platform_ids:
+        pl = _sb_execute(
+            supabase.table("platforms").select("id,name,calc_type,token_usd_rate,active").in_("id", platform_ids),
+            "platforms for accounts",
+        ).data or []
+        pl_map = {p["id"]: p for p in pl}
+
+    out = []
+    for r in rows:
+        p = pl_map.get(r.get("platform_id"), {})
+        out.append(
+            {
+                **r,
+                "platform_name": p.get("name"),
+                "calc_type": p.get("calc_type"),
+                "token_usd_rate": p.get("token_usd_rate"),
+                "platform_active": p.get("active", True),
+            }
+        )
+    return out
+
+@app.post("/models/{model_id}/accounts")
+def upsert_model_account(model_id: str, payload: ModelPlatformAccountUpsert):
+    model_id = _require_uuid(model_id, "model_id")
+    _get_model_or_404(model_id)
+
+    platform_id = _require_uuid(payload.platform_id, "platform_id")
+    _get_platform_or_404(platform_id)
+
+    if not payload.username or not payload.username.strip():
+        raise HTTPException(status_code=400, detail="username is required")
+
+    data = payload.model_dump()
+    data["model_id"] = model_id
+    data["platform_id"] = platform_id
+    data["username"] = payload.username.strip()
+
+    # Upsert por (model_id, platform_id) según tu unique index
+    res = _sb_execute(
+        supabase.table("model_platform_accounts").upsert(data, on_conflict="model_id,platform_id"),
+        "upsert model_platform_accounts",
+    )
+    if not res.data:
+        return {"ok": True}
+    return res.data[0]
+
+@app.patch("/models/{model_id}/accounts/{platform_id}")
+def patch_model_account(model_id: str, platform_id: str, payload: ModelPlatformAccountPatch):
+    model_id = _require_uuid(model_id, "model_id")
+    platform_id = _require_uuid(platform_id, "platform_id")
+    _get_model_or_404(model_id)
+    _get_platform_or_404(platform_id)
+
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    if "username" in data and data["username"] is not None:
+        if not str(data["username"]).strip():
+            raise HTTPException(status_code=400, detail="username cannot be empty")
+        data["username"] = str(data["username"]).strip()
+
+    res = _sb_execute(
+        supabase.table("model_platform_accounts")
+        .update(data)
+        .eq("model_id", model_id)
+        .eq("platform_id", platform_id),
+        "patch model_platform_accounts",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Account not found for model/platform")
+    return res.data[0]
+
+@app.delete("/models/{model_id}/accounts/{platform_id}")
+def deactivate_model_account(model_id: str, platform_id: str):
+    model_id = _require_uuid(model_id, "model_id")
+    platform_id = _require_uuid(platform_id, "platform_id")
+    _get_model_or_404(model_id)
+    _get_platform_or_404(platform_id)
+
+    res = _sb_execute(
+        supabase.table("model_platform_accounts")
+        .update({"is_active": False})
+        .eq("model_id", model_id)
+        .eq("platform_id", platform_id),
+        "deactivate model_platform_accounts",
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Account not found for model/platform")
+    return {"ok": True, "model_id": model_id, "platform_id": platform_id, "is_active": False}
+
+
+# -------------------------
+# Payroll Generate
+# -------------------------
+class PayrollRowOverride(BaseModel):
+    username: str
+    tokens: float = 0
+    raw: Optional[Dict[str, Any]] = None
+
+class PayrollGenerateRequest(BaseModel):
+    income_source_id: str
+    date_from: date
+    date_to: date
+
+    # ✅ Para probar YA sin integración: manda rows_override
+    rows_override: Optional[List[PayrollRowOverride]] = None
+
+    # ✅ Para ver qué trae "por debajo" (como tu duda del Network)
+    debug_return_raw: bool = True
+
+@app.post("/payroll/generate")
+def payroll_generate(payload: PayrollGenerateRequest):
+    income_source_id = _require_uuid(payload.income_source_id, "income_source_id")
+
+    # 1) Traer source
+    src_res = _sb_execute(
+        supabase.table("platform_income_sources").select("*").eq("id", income_source_id).single(),
+        "get income_source for payroll",
+    )
+    src = src_res.data
+    if not src:
+        raise HTTPException(status_code=404, detail="Income source not found")
+
+    platform_id = _require_uuid(src.get("platform_id"), "platform_id")
+    _get_platform_or_404(platform_id)
+
+    # 2) Crear report (running)
+    report_ins = {
+        "income_source_id": income_source_id,
+        "date_from": str(payload.date_from),
+        "date_to": str(payload.date_to),
+        "status": "running",
+        "warnings_count": 0,
+        "errors_count": 0,
+        "created_by": None,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    rep_res = _sb_execute(
+        supabase.table("platform_reports").insert(report_ins),
+        "insert platform_reports",
+    )
+    if not rep_res.data:
+        raise HTTPException(status_code=500, detail="Report insert failed")
+    report = rep_res.data[0]
+    report_id = report["id"]
+
+    # 3) Cargar mapa username->model_id para esa plataforma
+    accounts = _sb_execute(
+        supabase.table("model_platform_accounts")
+        .select("model_id, platform_id, username, is_active")
+        .eq("platform_id", platform_id)
+        .eq("is_active", True),
+        "load model_platform_accounts for matching",
+    ).data or []
+
+    user_map = {}  # lower(username)->model_id
+    for a in accounts:
+        u = _norm_user(a.get("username"))
+        if u:
+            user_map[u] = a.get("model_id")
+
+    # 4) Obtener filas externas:
+    #    - si rows_override viene: usamos eso (para probar YA)
+    #    - si no viene: dejamos placeholder (sin romper)
+    external_rows: List[Dict[str, Any]] = []
+    if payload.rows_override:
+        for r in payload.rows_override:
+            external_rows.append({"username": r.username, "tokens": r.tokens, "raw": r.raw})
+    else:
+        # Placeholder: todavía no integramos la API real de la plataforma
+        external_rows = []
+
+    # 5) Insertar report_rows
+    rows_to_insert = []
+    warnings = 0
+
+    for r in external_rows:
+        ext_user = (r.get("username") or "").strip()
+        tokens = float(r.get("tokens") or 0)
+        raw = r.get("raw")
+
+        matched_model_id = user_map.get(_norm_user(ext_user))
+        if tokens == 0:
+            status = "no_data"
+        elif matched_model_id:
+            status = "matched"
+        else:
+            status = "unmatched"
+            warnings += 1
+
+        row_ins = {
+            "report_id": report_id,
+            "platform_id": platform_id,
+            "external_username": ext_user,
+            "tokens": tokens,
+            "raw": raw if payload.debug_return_raw else None,
+            "matched_model_id": matched_model_id,
+            "status": status,
+            "message": None if matched_model_id else ("No match in model_platform_accounts" if tokens != 0 else "0 tokens"),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        rows_to_insert.append(row_ins)
+
+    if rows_to_insert:
+        _sb_execute(
+            supabase.table("platform_report_rows").insert(rows_to_insert),
+            "insert platform_report_rows",
+        )
+
+    # 6) Marcar report done
+    rep_upd = _sb_execute(
+        supabase.table("platform_reports")
+        .update(
+            {
+                "status": "done",
+                "warnings_count": warnings,
+                "errors_count": 0,
+                "finished_at": datetime.utcnow().isoformat(),
+            }
+        )
+        .eq("id", report_id),
+        "update platform_reports done",
+    )
+
+    # 7) Respuesta
+    rows = _sb_execute(
+        supabase.table("platform_report_rows")
+        .select("*")
+        .eq("report_id", report_id)
+        .order("created_at", desc=False),
+        "load report rows",
+    ).data or []
+
+    return {
+        "report": rep_upd.data[0] if rep_upd.data else report,
+        "source": {
+            "id": src.get("id"),
+            "platform_id": platform_id,
+            "alias": src.get("alias"),
+            "source_type": src.get("source_type"),
+            "username": src.get("username"),
+            "is_active": src.get("is_active"),
+        },
+        "summary": {
+            "rows": len(rows),
+            "warnings_unmatched": warnings,
+            "note": "Si rows_override es vacío y aún no hay integración, rows puede salir 0 (normal).",
+        },
+        "rows": rows,
+    }
+

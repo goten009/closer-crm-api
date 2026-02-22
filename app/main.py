@@ -2650,58 +2650,61 @@ def payroll_generate(payload: PayrollGenerateRequest):
         if u:
             user_map[u] = a.get("model_id")
 
-    # 4) Obtener filas externas:
+        # 4) Obtener filas externas:
     external_rows: List[Dict[str, Any]] = []
+
     if payload.rows_override:
         for r in payload.rows_override:
             external_rows.append({"username": r.username, "tokens": r.tokens, "raw": r.raw})
     else:
-    # ==========================================
-    # Integración real por plataforma
-    # ==========================================
-    platform_row = _sb_execute(
-        supabase.table("platforms")
-        .select("id,name")
-        .eq("id", platform_id)
-        .single(),
-        "get platform for adapter",
-    ).data
+        # ==========================================
+        # Integración real por plataforma
+        # ==========================================
+        platform_row = _sb_execute(
+            supabase.table("platforms")
+            .select("id,name")
+            .eq("id", platform_id)
+            .single(),
+            "get platform for adapter",
+        ).data
 
-    platform_name = (platform_row.get("name") or "").strip().lower() if platform_row else ""
+        platform_name = (platform_row.get("name") or "").strip().lower() if platform_row else ""
 
-    if platform_name in ("chaturbate", "cb"):
-        api_token = (src.get("api_key_enc") or "").strip()
+        if platform_name in ("chaturbate", "cb"):
+            api_token = (src.get("api_key_enc") or "").strip()
 
-        try:
-            adapter = ChaturbateAdapter(
-                CHB_STATS_BASE_URL,
-                timeout=CHB_TIMEOUT_SECONDS,
-            )
+            try:
+                adapter = ChaturbateAdapter(
+                    CHB_STATS_BASE_URL,
+                    timeout=CHB_TIMEOUT_SECONDS,
+                )
 
-            external_rows = adapter.fetch_rows(
-                api_token,
-                payload.date_from,
-                payload.date_to,
-            )
+                external_rows = adapter.fetch_rows(
+                    api_token,
+                    payload.date_from,
+                    payload.date_to,
+                )
 
-        except Exception as e:
-            _sb_execute(
-                supabase.table("platform_reports")
-                .update({
-                    "status": "error",
-                    "errors_count": 1,
-                    "finished_at": datetime.utcnow().isoformat(),
-                })
-                .eq("id", report_id),
-                "mark report error",
-            )
+            except Exception as e:
+                _sb_execute(
+                    supabase.table("platform_reports")
+                    .update(
+                        {
+                            "status": "error",
+                            "errors_count": 1,
+                            "finished_at": datetime.utcnow().isoformat(),
+                        }
+                    )
+                    .eq("id", report_id),
+                    "mark report error",
+                )
 
-            raise HTTPException(
-                status_code=500,
-                detail=f"Chaturbate integration failed: {str(e)}",
-            )
-    else:
-        external_rows = []
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Chaturbate integration failed: {str(e)}",
+                )
+        else:
+            external_rows = []
 
     # 5) Insertar report_rows
     rows_to_insert = []

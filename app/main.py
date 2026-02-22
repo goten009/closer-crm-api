@@ -1,4 +1,6 @@
 import os
+import requests
+from typing import Tuple
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import date, datetime
 from uuid import UUID
@@ -38,6 +40,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =========================
+# CHB (Chaturbate) Stats API Config
+# =========================
+CHB_STATS_BASE_URL = os.getenv("CHB_STATS_BASE_URL", "").strip()
+CHB_TIMEOUT_SECONDS = int(os.getenv("CHB_TIMEOUT_SECONDS", "30"))
 
 # =========================
 # Validation error handler
@@ -2505,6 +2512,92 @@ class PayrollGenerateRequest(BaseModel):
     # ✅ Para ver qué trae "por debajo"
     debug_return_raw: bool = True
 
+# ==========================================================
+# CHATUREBATE ADAPTER (NO MODIFICA NADA EXISTENTE)
+# ==========================================================
+
+class ChaturbateAdapter:
+    """
+    Adapter para obtener tokens por broadcaster en un rango de fechas.
+
+    Usa:
+      - CHB_STATS_BASE_URL (env var)
+      - api_key_enc guardado en platform_income_sources
+
+    Retorna filas normalizadas:
+      [
+        {
+          "username": "modelx",
+          "tokens": 1234,
+          "raw": {...}
+        }
+      ]
+    """
+
+    def __init__(self, base_url: str, timeout: int = 30):
+        if not base_url:
+            raise ValueError("CHB_STATS_BASE_URL no está configurado en variables de entorno.")
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def fetch_rows(self, api_token: str, date_from: date, date_to: date):
+        if not api_token or not str(api_token).strip():
+            raise ValueError("api_token vacío para Chaturbate.")
+
+        # ⚠️ Ajusta el endpoint real cuando confirmes la URL exacta
+        endpoint_path = "/stats"
+        url = f"{self.base_url}{endpoint_path}"
+
+        params = {
+            "date_from": str(date_from),
+            "date_to": str(date_to),
+        }
+
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Accept": "application/json",
+        }
+
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=self.timeout,
+        )
+
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Chaturbate API error {response.status_code}: {response.text[:300]}"
+            )
+
+        data = response.json()
+
+        normalized_rows = []
+
+        # Caso 1: {"rows":[...]}
+        if isinstance(data, dict) and isinstance(data.get("rows"), list):
+            for row in data["rows"]:
+                normalized_rows.append({
+                    "username": (row.get("username") or row.get("broadcaster") or "").strip(),
+                    "tokens": float(row.get("tokens") or row.get("total_tokens") or 0),
+                    "raw": row,
+                })
+            return normalized_rows
+
+        # Caso 2: lista directa
+        if isinstance(data, list):
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                normalized_rows.append({
+                    "username": (row.get("username") or row.get("broadcaster") or "").strip(),
+                    "tokens": float(row.get("tokens") or row.get("total_tokens") or 0),
+                    "raw": row,
+                })
+            return normalized_rows
+
+        raise RuntimeError("Formato inesperado en respuesta de Chaturbate.")
+
 
 @app.post("/payroll/generate")
 def payroll_generate(payload: PayrollGenerateRequest):
@@ -2563,7 +2656,51 @@ def payroll_generate(payload: PayrollGenerateRequest):
         for r in payload.rows_override:
             external_rows.append({"username": r.username, "tokens": r.tokens, "raw": r.raw})
     else:
-        # Placeholder: todavía no integramos la API real de la plataforma
+    # ==========================================
+    # Integración real por plataforma
+    # ==========================================
+    platform_row = _sb_execute(
+        supabase.table("platforms")
+        .select("id,name")
+        .eq("id", platform_id)
+        .single(),
+        "get platform for adapter",
+    ).data
+
+    platform_name = (platform_row.get("name") or "").strip().lower() if platform_row else ""
+
+    if platform_name in ("chaturbate", "cb"):
+        api_token = (src.get("api_key_enc") or "").strip()
+
+        try:
+            adapter = ChaturbateAdapter(
+                CHB_STATS_BASE_URL,
+                timeout=CHB_TIMEOUT_SECONDS,
+            )
+
+            external_rows = adapter.fetch_rows(
+                api_token,
+                payload.date_from,
+                payload.date_to,
+            )
+
+        except Exception as e:
+            _sb_execute(
+                supabase.table("platform_reports")
+                .update({
+                    "status": "error",
+                    "errors_count": 1,
+                    "finished_at": datetime.utcnow().isoformat(),
+                })
+                .eq("id", report_id),
+                "mark report error",
+            )
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"Chaturbate integration failed: {str(e)}",
+            )
+    else:
         external_rows = []
 
     # 5) Insertar report_rows

@@ -2518,20 +2518,22 @@ class PayrollGenerateRequest(BaseModel):
 
 class ChaturbateAdapter:
     """
-    Adapter para obtener tokens por broadcaster en un rango de fechas.
+    Adapter para consultar Chaturbate Affiliate Stats API (apistats).
 
     Usa:
-      - CHB_STATS_BASE_URL (env var)
-      - api_key_enc guardado en platform_income_sources
+      - CHB_STATS_BASE_URL (env var)  -> ej: https://es.chaturbate.com/affiliates/apistats
+      - token (src.api_key_enc)       -> va como query param "token"
+      - username (src.username)       -> va como query param "username"
 
     Retorna filas normalizadas:
       [
-        {
-          "username": "modelx",
-          "tokens": 1234,
-          "raw": {...}
-        }
+        {"username": "<external_username>", "tokens": <float>, "raw": {...}}
       ]
+
+    Nota:
+      - Si el API no entrega breakdown por broadcaster/modelo (rows vacíos),
+        devolvemos un SOLO row agregado usando los totals de "Cashed-out Tokens"
+        (si existe). Eso por ahora permite que el pipeline funcione sin romper.
     """
 
     def __init__(self, base_url: str, timeout: int = 30):
@@ -2540,22 +2542,55 @@ class ChaturbateAdapter:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-    def fetch_rows(self, api_token: str, date_from: date, date_to: date):
+    def _extract_tokens_from_apistats(self, data: dict) -> float:
+        """
+        Intenta sacar un total de tokens desde la respuesta apistats.
+        Prioridad:
+          1) program == "Cashed-out Tokens" y totals["Tokens"]
+          2) cualquier totals["Tokens"] numérico que aparezca
+          3) 0
+        """
+        try:
+            stats = data.get("stats", [])
+            # 1) buscar el bloque "Cashed-out Tokens"
+            for block in stats:
+                if (block.get("program") or "").strip().lower() == "cashed-out tokens":
+                    totals = block.get("totals", {}) or {}
+                    t = totals.get("Tokens")
+                    if t is not None:
+                        return float(t)
+            # 2) fallback: cualquier totals.Tokens
+            for block in stats:
+                totals = block.get("totals", {}) or {}
+                t = totals.get("Tokens")
+                if t is not None:
+                    return float(t)
+        except Exception:
+            pass
+        return 0.0
+
+    def fetch_rows(self, api_token: str, master_username: str, date_from: date, date_to: date):
         if not api_token or not str(api_token).strip():
             raise ValueError("api_token vacío para Chaturbate.")
+        if not master_username or not str(master_username).strip():
+            raise ValueError("username vacío para Chaturbate (platform_income_sources.username).")
 
-        # ⚠️ Ajusta el endpoint real cuando confirmes la URL exacta
-        endpoint_path = "/stats"
-        url = f"{self.base_url}{endpoint_path}"
+        url = f"{self.base_url}/"  # apistats funciona así
 
         params = {
-            "date_from": str(date_from),
-            "date_to": str(date_to),
+            "username": str(master_username).strip(),
+            "token": str(api_token).strip(),
+            # En tu JSON aparece range.start_date / end_date, normalmente se manda así:
+            "start_date": str(date_from),
+            "end_date": str(date_to),
+            # Si más adelante confirmas breakdown por broadcaster, lo cambias aquí:
+            # "breakdown": "Broadcaster",
         }
 
         headers = {
-            "Authorization": f"Bearer {api_token}",
             "Accept": "application/json",
+            # Ayuda contra respuestas HTML / WAFs:
+            "User-Agent": "CloserCRM/1.0 (+https://closerpereira)",
         }
 
         response = requests.get(
@@ -2565,39 +2600,65 @@ class ChaturbateAdapter:
             timeout=self.timeout,
         )
 
+        # Si devuelve HTML (cloudflare / forbidden) lo mostramos claro
+        ctype = (response.headers.get("Content-Type") or "").lower()
         if response.status_code >= 400:
-            raise RuntimeError(
-                f"Chaturbate API error {response.status_code}: {response.text[:300]}"
-            )
+            snippet = response.text[:300]
+            raise RuntimeError(f"Chaturbate API error {response.status_code}: {snippet}")
+
+        if "application/json" not in ctype:
+            snippet = response.text[:300]
+            raise RuntimeError(f"Respuesta no-JSON desde Chaturbate (Content-Type={ctype}): {snippet}")
 
         data = response.json()
 
+        # Intento 1: si algún día viene rows con breakdown por broadcaster
         normalized_rows = []
 
-        # Caso 1: {"rows":[...]}
-        if isinstance(data, dict) and isinstance(data.get("rows"), list):
-            for row in data["rows"]:
-                normalized_rows.append({
-                    "username": (row.get("username") or row.get("broadcaster") or "").strip(),
-                    "tokens": float(row.get("tokens") or row.get("total_tokens") or 0),
-                    "raw": row,
-                })
-            return normalized_rows
+        # Estructura típica: {"stats":[...], "range": {...}, "breakdown": "..."}
+        if isinstance(data, dict):
+            # Si algún bloque trae rows con username/broadcaster + tokens
+            stats = data.get("stats", [])
+            if isinstance(stats, list):
+                for block in stats:
+                    rows = block.get("rows")
+                    cols = block.get("columns")
+                    if isinstance(rows, list) and rows and isinstance(cols, list) and cols:
+                        # Intento mapear columnas -> dict
+                        # Si existe columna Tokens y alguna de Username/Broadcaster
+                        cols_norm = [str(c).strip().lower() for c in cols]
+                        if "tokens" in cols_norm:
+                            idx_tokens = cols_norm.index("tokens")
+                            # buscar username/broadcaster
+                            idx_user = None
+                            for key in ("username", "broadcaster", "room", "modelo"):
+                                if key in cols_norm:
+                                    idx_user = cols_norm.index(key)
+                                    break
 
-        # Caso 2: lista directa
-        if isinstance(data, list):
-            for row in data:
-                if not isinstance(row, dict):
-                    continue
-                normalized_rows.append({
-                    "username": (row.get("username") or row.get("broadcaster") or "").strip(),
-                    "tokens": float(row.get("tokens") or row.get("total_tokens") or 0),
-                    "raw": row,
-                })
-            return normalized_rows
+                            if idx_user is not None:
+                                for r in rows:
+                                    if not isinstance(r, list) or len(r) <= max(idx_tokens, idx_user):
+                                        continue
+                                    u = str(r[idx_user]).strip()
+                                    t = r[idx_tokens]
+                                    try:
+                                        t = float(t)
+                                    except Exception:
+                                        t = 0.0
+                                    normalized_rows.append({"username": u, "tokens": t, "raw": {"block": block, "row": r}})
+                if normalized_rows:
+                    return normalized_rows
+
+            # Intento 2: fallback agregado
+            total_tokens = self._extract_tokens_from_apistats(data)
+            return [{
+                "username": str(master_username).strip(),
+                "tokens": float(total_tokens),
+                "raw": data,
+            }]
 
         raise RuntimeError("Formato inesperado en respuesta de Chaturbate.")
-
 
 @app.post("/payroll/generate")
 def payroll_generate(payload: PayrollGenerateRequest):

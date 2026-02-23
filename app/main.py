@@ -2733,6 +2733,13 @@ def payroll_generate(payload: PayrollGenerateRequest):
 
         if platform_name in ("chaturbate", "cb"):
             api_token = (src.get("api_key_enc") or "").strip()
+            master_username = (src.get("username") or "").strip()  # <-- ESTE ERA EL QUE FALTABA
+
+            if not master_username:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Income source username is required for Chaturbate (platform_income_sources.username)",
+                )
 
             try:
                 adapter = ChaturbateAdapter(
@@ -2742,6 +2749,7 @@ def payroll_generate(payload: PayrollGenerateRequest):
 
                 external_rows = adapter.fetch_rows(
                     api_token,
+                    master_username,
                     payload.date_from,
                     payload.date_to,
                 )
